@@ -8,6 +8,17 @@
 - 通配订阅 ``"*"`` 收到一切事件。
 
 单个 handler 抛异常不影响其他 handler 的执行。
+
+线程语义（v1.1 明确）:
+
+- 总线内部是普通 dict / list，无锁、无 await 临界区；单个 ``emit``
+  调用是原子的（纯同步代码，不会中途让出）。
+- 因此「从任意线程同步调用 ``emit`` / ``subscribe`` / ``unsubscribe``」
+  是安全的：handler 在**调用方线程**立即执行。
+- 跨线程协程 handler 不会被 ``emit`` 调度（调度依赖运行中的事件循环，
+  即 ``asyncio.get_running_loop`` 是线程局部的）。
+- 危险模式是「多线程并发 subscribe 同一事件」造成的 list 竞争--框架
+  层约定：订阅只发生在插件 load/unload（内核线程），UI 线程只 emit。
 """
 
 from __future__ import annotations

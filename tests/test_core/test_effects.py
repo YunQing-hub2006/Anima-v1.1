@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from anima.core.bus import EventBus
@@ -156,3 +158,106 @@ def test_count():
     tracker.push(lambda: None)
     tracker.push(lambda: None)
     assert tracker.count() == 2
+
+
+# ---------- v1.1: push_task 后台任务回滚 ----------
+
+
+async def test_push_task_cancels_on_rollback():
+    """rollback 后登记的任务被取消。"""
+    tracker = EffectTracker()
+    finished = asyncio.Event()
+
+    async def long_running():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            finished.set()
+
+    task = asyncio.ensure_future(long_running())
+    tracker.push_task(task)
+    assert tracker.count() == 1
+
+    await tracker.rollback()
+    assert task.cancelled()
+    assert finished.is_set()
+    assert tracker.count() == 0
+
+
+async def test_push_task_awaits_completion():
+    """rollback 等待任务真正结束（finally 执行完）而非仅发 cancel。"""
+    tracker = EffectTracker()
+    cleanup_done = asyncio.Event()
+
+    async def long_running():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            await asyncio.sleep(0)
+            cleanup_done.set()
+
+    task = asyncio.ensure_future(long_running())
+    tracker.push_task(task)
+    await tracker.rollback()
+    assert cleanup_done.is_set()
+
+
+async def test_push_task_exception_isolated():
+    """task 抛异常不阻断其他回滚，异常进入 RollbackError 聚合。"""
+    tracker = EffectTracker()
+    executed: list[str] = []
+
+    async def boom():
+        raise RuntimeError("任务崩溃")
+
+    boom_task = asyncio.ensure_future(boom())
+    await asyncio.sleep(0)  # 让 boom 先抛出
+    tracker.push_task(boom_task)
+    tracker.push(lambda: executed.append("after"))
+
+    with pytest.raises(RollbackError) as info:
+        await tracker.rollback()
+    # 其他回滚照常执行
+    assert executed == ["after"]
+    # task 的异常被聚合（CancelledError 之外的失败被收集）
+    assert len(info.value.errors) == 1
+    assert isinstance(info.value.errors[0], RuntimeError)
+
+
+async def test_push_task_already_done():
+    """已完成的 task 登记后 rollback 是空操作。"""
+    tracker = EffectTracker()
+
+    async def quick():
+        return 42
+
+    task = asyncio.ensure_future(quick())
+    await task
+    tracker.push_task(task)
+    await tracker.rollback()  # 不抛异常
+
+
+async def test_push_task_lifo_with_plain_push():
+    """push_task 与普通 push 同栈，LIFO 顺序保持。"""
+    tracker = EffectTracker()
+    order: list[str] = []
+
+    async def sleeper():
+        await asyncio.sleep(60)
+
+    task = asyncio.ensure_future(sleeper())
+    tracker.push(lambda: order.append("plain-first"))
+    tracker.push_task(task)
+    tracker.push(lambda: order.append("plain-last"))
+
+    await tracker.rollback()
+    # 后登记的先回滚：plain-last -> task.cancel -> plain-first
+    assert order == ["plain-last", "plain-first"]
+    assert task.cancelled()
+
+
+def test_push_task_rejects_non_task():
+    """push_task 传入非 Future/Task 抛 TypeError。"""
+    tracker = EffectTracker()
+    with pytest.raises(TypeError):
+        tracker.push_task("not-a-task")  # type: ignore[arg-type]

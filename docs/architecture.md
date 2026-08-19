@@ -1,8 +1,10 @@
-# Anima 内核架构设计（v1.0）
+# Anima 内核架构设计（v1.1）
 
 > 本文是内核的正式架构设计文档，配合 [core_api.md](core_api.md)（接口签名）
 > 与 [maintenance.md](maintenance.md)（开发维护指南）使用。
 > 内核公共接口自 v1.0 起冻结，变更需走评审流程（见维护指南第 6 节）。
+> v1.1 相对 v1.0 仅新增接口（`push_task`/`Context.task`）与线程语义
+> 文档化，详见 core_api.md 变更记录。
 
 ---
 
@@ -11,7 +13,7 @@
 | 维度 | 目标 | 达成情况 |
 |---|---|---|
 | 依赖 | 零外部依赖，`core/` 只 import 标准库 | ✅ 由 `check_kernel_rules.py` 自动检查 |
-| 规模 | `core/` < 1000 行 | ✅ 735 行 |
+| 规模 | `core/` < 1000 行 | ✅ 785 行 |
 | 类型 | 所有公共接口类型注解完整 | ✅ |
 | 测试 | 每模块行覆盖率 >= 90% | ✅ 总体 99%，最低模块 97% |
 | 性能 | 见第 8 节基准表 | ✅ 全部达标 |
@@ -198,6 +200,7 @@ unloaded ──load──> loaded ──enable──> enabled
 | 插件生命周期方法 | `_call()`：`inspect.isawaitable(result)` 决定是否 await |
 | EffectTracker cleanup | 同上，同步/异步 cleanup 可混合入栈 |
 | 总线 handler | `emit` 按 `iscoroutine(result)` 分派；`emit_async` 包装为 Task |
+| 后台任务（v1.1） | `ctx.task(coro)` 创建 Task 并纳入回滚栈，卸载时 cancel+await |
 
 ### 5.2 异常处理策略总表
 
@@ -214,12 +217,18 @@ unloaded ──load──> loaded ──enable──> enabled
 ### 5.3 副作用回滚语义
 
 ```
-push 顺序:  provide("db")  ->  on("tick")  ->  on_cleanup(f)
-回滚顺序:   f()  ->  unsubscribe("tick")  ->  unregister("db")
+push 顺序:  provide("db")  ->  on("tick")  ->  task(coro)
+回滚顺序:   cancel+await(task)  ->  unsubscribe("tick")  ->  unregister("db")
 ```
 
 后产生的副作用依赖先产生的（例如先 provide 服务再订阅用到该服务的事件），
 LIFO 保证拆卸顺序与建立顺序严格互逆。
+
+v1.1 的 `push_task` 把"取消并等待后台任务"作为一条普通 cleanup 入栈，
+复用 LIFO/异常聚合两条不变式。关键细节：cancel 请求若落在**从未启动**
+的协程上，协程体（含 finally）不会执行，因此回滚代码先 `await sleep(0)`
+让出一拍、保证协程进入函数体后再 cancel；任务自身的非 CancelledError
+异常进入 RollbackError 聚合，不阻断其他回滚。
 
 ---
 
@@ -270,13 +279,24 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 
 ## 7. 并发模型
 
-- **v1.0 假设单线程事件循环**：`EventBus`、`ServiceRegistry`、
-  `EffectTracker` 内部是普通 dict/list，未加锁。在同一个 asyncio 循环内
-  使用是完全安全的（无 await 点的临界区不会被打断）。
-- **跨线程/跨循环未支持**：从其他线程直接调用内核 API 属于未定义行为。
-  规划中的演进（见 10）是 `bus.emit_threadsafe()` 网关，v1.0 不提供。
+- **v1.1 线程语义（正式结论）**：`EventBus`、`ServiceRegistry`、
+  `EffectTracker` 内部是普通 dict/list，未加锁；但单个 `emit` /
+  `subscribe` / `unregister` 调用是纯同步代码，**无 await 临界区**，
+  在 CPython GIL 下是原子的。因此：
+  - **从任意线程同步调用 `bus.emit` 是安全的**——handler 在**调用方线程**
+    立即执行（AnimaPet 的 Qt 主线程 emit → 规则引擎同步触发 → bridge
+    同步更新 UI，全程不离开调用线程）。
+  - **跨线程 `emit` 的协程 handler 不会被调度**：调度依赖
+    `asyncio.get_running_loop()`，它是线程局部的；UI 线程没有运行中的
+    内核循环时，协程结果被丢弃（与 v1.0 行为一致）。
+  - **危险模式是多线程并发 subscribe 同一事件**造成的 list 竞争。
+    框架层约定：**订阅只发生在插件 load/unload（内核线程）**，
+    UI 线程只 emit。该约定写入了 bus.py 的模块 docstring。
+- **多线程并发 use/register** 不安全：ServiceRegistry 同理约定由
+  内核线程独占写入；`use`（只读 dict.get）从任意线程安全。
 - `emit` 在无运行循环时收到协程 handler 会丢弃该协程（并 close），
-  保证同步上下文调用永不失败——文档与测试固定了这一行为。
+  保证同步上下文调用永不失败。
+- 真正的 `emit_threadsafe` 网关仍登记为演进方向（见 §10），v1.1 不提供。
 
 ---
 
@@ -313,6 +333,13 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
    自定义清理"的成本降为零。
 7. **协程 handler 在同步 `emit` 下调度而非报错**：发布方无需关心订阅者是
    同步还是异步；无循环时丢弃是显式选择的保守行为。
+8. **v1.1 `push_task` 先 `sleep(0)` 再 cancel**：cancel 请求落在从未启动
+   的协程上时，异常在函数定义点抛出、协程体（含 finally）不执行——
+   因此回滚必须先让出一拍让协程进入函数体，否则"卸载时清理"承诺失效。
+   代价是多一个循环节拍的延迟，对回滚路径可接受。
+9. **v1.1 `Context.task` 不返回 self**：链式 API 的唯一例外，因为调用方
+   需要 Task 引用做进一步控制（await / add_done_callback）。docstring 与
+   core_api.md 显式标注，避免后人误改。
 
 ---
 
@@ -320,8 +347,9 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 
 | 方向 | 说明 | 接入点 |
 |---|---|---|
-| 线程安全总线 | `emit_threadsafe()` 经 `loop.call_soon_threadsafe` | bus.py |
+| 线程安全总线 | `emit_threadsafe()` 经 `loop.call_soon_threadsafe`（v1.1 已文档化跨线程同步 emit 安全，此项为协程 handler 的跨线程调度网关） | bus.py |
 | 严格服务获取 | `use_strict()` 抛 `ServiceNotFoundError`（已预留） | registry.py |
+| 类型形式 provide/use | `ctx.provide(ConfigService, ...)`（v1.1 登记为框架层封装，不进内核） | plugins 层 |
 | 插件热重载 | 文件监听属 `anima/plugins/hotreload.py`，内核不需改动 | plugins/ |
 | 事件优先级/延迟 | handler 包装排序（`_wild_matches` 已有排序钩子位） | bus.py |
 | 条件启用 | config 切片加 `enabled: false` 约定 | lifecycle.py |

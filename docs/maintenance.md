@@ -89,6 +89,11 @@ pyproject.toml         pytest/coverage 配置
 - EffectTracker 改动必须保住三个不变式：LIFO、单项失败继续、结束后栈必空。
   对应用例：`test_push_rollback_lifo` / `test_rollback_exception_survival` /
   `test_effect_tracker_rollback_with_all_failing`。
+- **v1.1 `push_task` 的额外不变式**：cancel 前必须先 `await sleep(0)`
+  让协程进入函数体，否则 finally 不执行（见 ADR 8）。若改回滚顺序，
+  回归 `test_push_task_cancels_on_rollback` /
+  `test_push_task_awaits_completion` 必须先过。非 Future 入参抛 TypeError
+  的防御分支由 `test_push_task_rejects_non_task` 锁死。
 
 ### lifecycle.py
 - 状态机转换表集中在 `enable/disable/unload` 三个方法开头，改转换规则 =
@@ -99,11 +104,16 @@ pyproject.toml         pytest/coverage 配置
   卸载"，会破坏 `unload_all` 的完整性，属重大变更。
 
 ### context.py / app.py
-- Context 全部方法返回 `self`；新增方法同样返回 `self` 且不抛业务异常。
+- Context **除 `task` 外**全部方法返回 `self`；新增方法默认返回 `self`
+  且不抛业务异常。`task` 是 v1.1 的有意例外（返回 Task），见 ADR 9，
+  不要"顺手"改成链式。
 - `config` 切片是引用共享（对 app.config 的修改插件可见）--这是特性不是 bug，
   不要改成拷贝。
 - `App.start` 防重入、`stop` 幂等可重启，两条测试
   （`test_app_double_start_raises` / `test_app_restartable`）锁死该行为。
+- **v1.1 `Context.task` 无事件循环时抛 RuntimeError**（与 bus 协程 handler
+  调度语义一致），由 `test_context_task_without_loop_raises` 锁死；不要改成
+  隐式建循环，那会让线程归属变模糊。
 
 ## 6. 接口变更流程（冻结后）
 

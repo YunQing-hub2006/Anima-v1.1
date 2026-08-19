@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Self
+import asyncio
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Self
 
 from anima.core.effects import CleanupFn
 
@@ -61,3 +62,14 @@ class Context:
         """登记自定义清理操作，插件卸载时逆序执行。"""
         self.effects.push(callback)
         return self
+
+    def task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """创建后台任务；插件卸载时自动取消并等待其结束。
+
+        这是 Context 上唯一不返回 ``self`` 的方法（返回 Task 本身，
+        供调用方做进一步控制）。需要运行中的事件循环，与总线的协程
+        handler 调度语义一致。
+        """
+        task = asyncio.ensure_future(coro)
+        self.effects.push_task(task)
+        return task

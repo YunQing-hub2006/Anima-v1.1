@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -29,6 +31,31 @@ class EffectTracker:
     def push(self, rollback: CleanupFn) -> None:
         """压入一个回滚操作；同一函数重复压入会被记录多次。"""
         self._stack.append(rollback)
+
+    def push_task(self, task: asyncio.Future[Any]) -> asyncio.Future[Any]:
+        """登记一个后台任务，回滚时取消并等待其真正结束。
+
+        已完成的任务登记后 rollback 是空操作；任务自身的异常（取消
+        之外）会进入 :class:`RollbackError` 聚合。
+        """
+        if not isinstance(task, asyncio.Future):
+            raise TypeError(f"push_task 需要 asyncio.Future/Task，得到 {type(task).__name__}")
+
+        async def _cancel_and_await() -> None:
+            if not task.done():
+                # 先让出一个循环节拍：cancel 落在从未启动的协程上时，
+                # 异常在函数定义点抛出，协程体（含 finally）不会执行。
+                await asyncio.sleep(0)
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            else:
+                # 已结束的任务：re-raise 让 rollback 感知失败（若有）
+                await task
+
+        self.push(_cancel_and_await)
+        return task
 
     def on(self, target: "EventBus", event: str, handler: Callable[[Any], Any]) -> None:
         """订阅事件并自动记录对应的取消订阅。"""

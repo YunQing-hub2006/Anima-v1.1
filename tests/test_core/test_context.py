@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
+
+import pytest
 
 from anima.core.app import App
 from anima.core.context import Context
@@ -153,3 +156,52 @@ def test_context_on_cleanup_with_async(app: App):
 
     ctx.on_cleanup(async_cleanup)
     assert ctx.effects.count() == 1
+
+
+# ---------- v1.1: task 后台任务 ----------
+
+
+async def test_context_task_returns_task(app: App):
+    """ctx.task 返回 asyncio.Task 并登记回滚。"""
+    ctx = _make_ctx(app, RecorderPlugin("task-owner"))
+
+    async def work():
+        return 7
+
+    task = ctx.task(work())
+    assert isinstance(task, asyncio.Task)
+    assert ctx.effects.count() == 1
+
+
+async def test_context_task_cancelled_on_unload(app: App):
+    """插件卸载后其后台任务被取消。"""
+    stopped = asyncio.Event()
+
+    class WorkerPlugin(Plugin):
+        name = "worker"
+
+        async def load(self, ctx: Context) -> None:
+            async def loop():
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    stopped.set()
+
+            ctx.task(loop())
+
+    await app.start([WorkerPlugin()])
+    await app.stop()
+    assert stopped.is_set()
+
+
+def test_context_task_without_loop_raises(app: App):
+    """无运行中的事件循环时 ctx.task 报 RuntimeError（与 bus 语义一致）。"""
+    ctx = _make_ctx(app, RecorderPlugin("no-loop"))
+
+    async def make():
+        return None
+
+    coro = make()
+    with pytest.raises(RuntimeError):
+        ctx.task(coro)
+    coro.close()

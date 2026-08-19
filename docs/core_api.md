@@ -1,7 +1,8 @@
-# Anima 内核 API 参考（v1.0，已冻结）
+# Anima 内核 API 参考（v1.1，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
+> v1.1 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -71,12 +72,18 @@ CleanupFn = Callable[[], None] | Callable[[], Awaitable[None]]
 
 class EffectTracker:
     def push(self, rollback: CleanupFn) -> None
+    def push_task(self, task: asyncio.Future) -> asyncio.Future   # v1.1
     def on(self, target: EventBus, event: str, handler: Callable) -> None
     def provide(self, registry: ServiceRegistry, name: str, instance: Any) -> None
     async def rollback(self) -> None    # LIFO；失败聚合为 RollbackError
     def count(self) -> int
     def clear(self) -> None             # 清空但不执行
 ```
+
+`push_task`（v1.1 新增）：登记后台任务，回滚时**取消并等待其真正
+结束**（先让出一个循环节拍保证协程体已启动，finally 能执行）；已
+完成的任务登记后 rollback 会 re-raise 其异常（进入 RollbackError
+聚合）；非 Future/Task 入参抛 `TypeError`。
 
 ## 插件上下文 — `context.py`
 
@@ -92,9 +99,13 @@ class Context:
     def provide(self, name: str, instance: Any) -> Self
     def use(self, name: str, default: Any = None) -> Any
     def on_cleanup(self, callback: CleanupFn) -> Self
+    def task(self, coro: Coroutine) -> asyncio.Task              # v1.1
 ```
 
-所有方法返回 `self`；`on`/`provide`/`on_cleanup` 自动登记回滚。
+除 `task` 外所有方法返回 `self`；`on`/`provide`/`on_cleanup`
+自动登记回滚。`task`（v1.1 新增）创建后台任务、登记"卸载时取消并
+等待"的回滚，返回 Task 本身（唯一不返回 `self` 的方法）；需要运行
+中的事件循环，无循环时抛 `RuntimeError`。
 
 ## 生命周期 — `lifecycle.py`
 
@@ -141,9 +152,30 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 
 | 指标 | 目标 | 实测 |
 |---|---|---|
-| emit 平均耗时（1000 次均值） | < 0.1 ms | ~3.2 us |
+| emit 平均耗时（1000 次均值） | < 0.1 ms | ~3.1 us |
 | 1000 handler 单次 emit（压力口径） | < 10 ms | ~1.2 ms |
 | 100 插件拓扑排序 | < 1 ms | ~0.13 ms |
 | 100 插件完整生命周期 | < 50 ms | ~2.2 ms |
 | EffectTracker 1000 项回滚 | < 10 ms | ~1.3 ms |
-| 空 App 内存（tracemalloc 峰值） | < 5 MB | ~0.8 KiB |
+| 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.1 KiB |
+
+## 变更记录
+
+### v1.1.0（2026-08-19）
+
+依据 AnimaPet 迁移计划 TD2 决策表，**仅新增接口**，v1.0 公共签名与语义
+不变（非破坏性变更，走 maintenance.md 冻结流程）：
+
+- 新增 `EffectTracker.push_task(task)`：后台任务纳入 LIFO 回滚栈，
+  卸载时取消并等待真正结束。
+- 新增 `Context.task(coro)`：插件后台任务入口，等价
+  `push_task(ensure_future(coro))`；唯一不返回 `self` 的 Context 方法。
+- `bus.py` 模块 docstring 明确线程语义：跨线程同步 `emit` 安全、
+  handler 在调用方线程执行、订阅约定只发生在内核线程（无代码改动）。
+- 规模 735 -> 785 行；测试 104 -> 113 个；覆盖率 99% 不变。
+- 类型形式 `provide(Class, ...)` / `use(Class)` 登记为演进方向，
+  由框架层（AnimaPet）封装，不进内核。
+
+### v1.0.0（2026-08-18）
+
+初始冻结版本。9 个模块 735 行，104 个测试，覆盖率 99%。
