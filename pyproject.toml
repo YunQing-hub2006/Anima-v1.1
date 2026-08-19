@@ -1,0 +1,24 @@
+[project]
+name = "anima"
+version = "1.0.0"
+description = "Anima 插件内核：零外部依赖的插件生命周期、事件总线与服务注册表"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["anima*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+source = ["anima.core"]
+
+[tool.coverage.report]
+show_missing = false
