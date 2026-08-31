@@ -1,8 +1,8 @@
-# Anima 内核 API 参考（v1.1，已冻结）
+# Anima 内核 API 参考（v1.1.1，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
-> v1.1 变更摘要见文末"变更记录"。
+> v1.1.1 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -52,6 +52,10 @@ class EventBus:
 
 通配规则：`"*"` 匹配一切；`"user.*"` 匹配以 `"user."` 开头的事件（不匹配裸 `"user"`）。
 `emit` 遇到协程 handler 会调度到运行中的事件循环（无循环则丢弃）。
+
+执行顺序契约（v1.1.1 明确）：**精确订阅的 handler 先于通配 handler 执行，
+两组各自内部按注册顺序执行**。同步 handler 立即执行；协程 handler 的
+执行时机由事件循环调度决定，与注册顺序无关。
 
 ## 服务注册表 — `registry.py`
 
@@ -126,6 +130,16 @@ class LifecycleManager:
 状态机：`unloaded -> loaded -> enabled -> disabled -> unloaded`；
 `enabled` 下 unload 先自动 disable。非法转换抛 `LifecycleError`。
 
+批量操作错误语义（v1.1.1 明确）：
+
+- `load_all` / `enable_all`：某插件钩子抛异常时，已注册的全部插件
+  （含失败者自身的部分副作用）按**逆加载序**尽力卸载，不留半加载
+  状态。回滚干净则原样重抛原始异常（含 `CancelledError`）；回滚自身
+  有清理失败则抛聚合 `RollbackError`（`__cause__` 指向原始异常，
+  `errors` 只含清理失败项）。失败后可重新 `load_all`。
+- `unload_all`：单插件清理失败聚合而不中断其余卸载，最后统一抛
+  `RollbackError`；`_load_order` 仍清空。
+
 ## 组装器 — `app.py`
 
 ```python
@@ -141,6 +155,14 @@ class App:
     def effects_for(self, plugin_name: str) -> EffectTracker
     def discard_effects(self, plugin_name: str) -> None
 ```
+
+`start` 错误语义（v1.1.1 明确）：load/enable 中途失败时，生命周期层
+回滚卸载已注册插件，App 再兜底清空 bus/registry/_effects，失败后可
+再次 `start`（不再残留内部状态导致"插件重复注册"）。
+
+`stop` 错误语义（v1.1.1 明确）：单插件卸载失败聚合为 `RollbackError`
+抛出，但总线/注册表清空与 `_started` 复位由 try/finally 保证必然
+执行——App 始终可重启。
 
 ## 公共导出 — `anima.core.__init__`
 
@@ -160,6 +182,19 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 | 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.1 KiB |
 
 ## 变更记录
+
+### v1.1.1（2026-08-21）
+
+三项缺陷修复，公共签名不变；批量操作的错误时行为有容错语义增强：
+
+- `load_all`/`enable_all` 失败原子回滚（逆加载序卸载全部已注册插件），
+  失败后可重新 start；回滚自身失败聚合抛 `RollbackError`。
+- `unload_all` 单插件清理失败不中断其余卸载，聚合后统一抛出。
+- `App.start`/`stop` 兜底清空与 `_started` 复位，始终可重启。
+- `bus.py` 移除 `_wild_matches` 内不可观察的排序死代码；明确
+  "精确先于通配、组内注册序"顺序契约。
+- `Context.effects` 注解改为运行时导入 + 裸注解。
+- 规模 785 -> 841 行；测试 113 -> 123 个；覆盖率 99% 不变。
 
 ### v1.1.0（2026-08-19）
 

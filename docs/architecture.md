@@ -183,7 +183,10 @@ unloaded ──load──> loaded ──enable──> enabled
 
 - `__init__` 创建 bus/registry/lifecycle 与 `config = {"plugins": {}}`。
 - `start`：`load_all -> enable_all`；运行中重复 `start` 抛 `LifecycleError`。
-- `stop`：`unload_all -> bus.clear() -> registry.clear() -> effects 清空`；
+  load/enable 中途失败时，生命周期层按逆加载序回滚已注册插件；
+  App 层再兜底清空 bus/registry/_effects，保证失败后可再次 `start`。
+- `stop`：`unload_all` 包在 try/finally 中，卸载异常也必然执行
+  `bus.clear() -> registry.clear() -> effects 清空 -> _started=False`；
   未启动时是空操作，stop 后可再次 start（可重启、不泄漏）。
 - start 因依赖错误失败后，`stop` 仍可安全调用（幂等兜底）。
 
@@ -213,6 +216,8 @@ unloaded ──load──> loaded ──enable──> enabled
 | 非法状态转换 | 抛 LifecycleError | 状态机显式失败 |
 | 重复 start | 抛 LifecycleError | 防止重复副作用 |
 | 重复 unsubscribe/unregister | 静默（幂等） | 与自动回滚路径配合必须安全 |
+| `plugin.load()` / `enable()` 抛异常 | 已注册插件逆序回滚卸载；回滚干净时重抛原始异常，回滚清理失败时抛聚合 RollbackError（cause 指向原始异常） | 批量启动原子性，不留半加载状态 |
+| `unload_all` 中单插件清理失败 | 聚合不中断，其余插件照常卸载，最后统一抛 RollbackError | 卸载完整性 > 单项失败 |
 
 ### 5.3 副作用回滚语义
 
@@ -247,22 +252,30 @@ App.start(plugins)
   │         plugin.load(ctx)
   │              ctx.provide(name, svc) ──> registry.register + tracker.push
   │              ctx.on(evt, handler)  ──> bus.subscribe   + tracker.push
+  │              load() 抛异常 ──────────> 已注册插件逆序回滚卸载
+  │                                        （含失败者自身的部分副作用）
+  │                                        回滚失败聚合 RollbackError
+  │                                        （cause 指向原始异常）
   ├─ LifecycleManager.enable_all()   # 依赖方保证晚于其依赖启用
   │    └─ plugin.enable()            # 此阶段 ctx.use() 安全
-  └─ App._started = True
+  │         enable() 抛异常 ──────────> 同上逆序回滚卸载
+  └─ 成功: App._started = True
+     失败: App 兜底 bus.clear()/registry.clear()/_effects.clear()，可重试
 ```
 
 ### 6.2 停止（App.stop，逆序回滚）
 
 ```
 App.stop()
-  └─ LifecycleManager.unload_all()   # 逆加载（拓扑）顺序
-       └─ 对每个插件（enabled 的先 disable）:
-            ├─ EffectTracker.rollback()   # LIFO，失败聚合
-            ├─ plugin.unload()            # 插件自定义清理
-            └─ state=unloaded; App.discard_effects(name)
-  ├─ bus.clear(); registry.clear()
-  └─ _started = False（可再次 start，不泄漏状态）
+  ├─ LifecycleManager.unload_all()   # 逆加载（拓扑）顺序
+  │    └─ 对每个插件（enabled 的先 disable）:
+  │         ├─ EffectTracker.rollback()   # LIFO，失败聚合
+  │         ├─ plugin.unload()            # 插件自定义清理
+  │         └─ state=unloaded; App.discard_effects(name)
+  │    # 单插件清理失败不中断其余卸载，最后统一抛 RollbackError
+  └─ finally（即使 unload_all 抛异常也执行）:
+       ├─ bus.clear(); registry.clear(); _effects.clear()
+       └─ _started = False（可再次 start，不泄漏状态）
 ```
 
 ### 6.3 事件发布
@@ -340,6 +353,18 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 9. **v1.1 `Context.task` 不返回 self**：链式 API 的唯一例外，因为调用方
    需要 Task 引用做进一步控制（await / add_done_callback）。docstring 与
    core_api.md 显式标注，避免后人误改。
+10. **v1.1.1 start 原子回滚**：load/enable 钩子失败时，已注册插件按逆
+    加载序尽力卸载，不留半加载状态。此前 ADR 2 的"失败恢复（直接
+    stop()）最简单"假设被 `stop()` 的 `_started` 早返回打破——半加载
+    状态不可达。修复后该承诺真正成立：失败后可再次 `start`。回滚自身
+    的清理失败聚合进 `RollbackError`（`__cause__` 指向原始异常），
+    不静默。
+11. **v1.1.1 handler 顺序契约**：精确 handler 先于通配 handler，组内
+    按注册顺序。此前 `_wild_matches` 只对通配 handler 做 sync-before-
+    async 排序而精确 handler 不排序，但该排序不可观察（异步 handler
+    从不内联执行），属死代码，已移除。契约写入 bus.py docstring 并以
+    `test_handler_order_contract` 锁死，演进方向若引入真正的优先级
+    排序需显式设计。
 
 ---
 
@@ -351,7 +376,7 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 | 严格服务获取 | `use_strict()` 抛 `ServiceNotFoundError`（已预留） | registry.py |
 | 类型形式 provide/use | `ctx.provide(ConfigService, ...)`（v1.1 登记为框架层封装，不进内核） | plugins 层 |
 | 插件热重载 | 文件监听属 `anima/plugins/hotreload.py`，内核不需改动 | plugins/ |
-| 事件优先级/延迟 | handler 包装排序（`_wild_matches` 已有排序钩子位） | bus.py |
+| 事件优先级/延迟 | handler 包装排序（v1.1.1 已移除 `_wild_matches` 内的不可观察排序钩子；真实优先级需显式设计执行顺序） | bus.py |
 | 条件启用 | config 切片加 `enabled: false` 约定 | lifecycle.py |
 
 任何演进若改动冻结接口，必须走第 6 节（维护指南）的变更评审流程。

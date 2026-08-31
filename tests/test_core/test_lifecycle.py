@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import pytest
 
 from anima.core.app import App
@@ -250,6 +253,157 @@ async def test_unload_all_skips_missing_entries(app: App):
     await app.lifecycle.unload("one")
     await app.lifecycle.unload_all()  # 不抛
     assert app.lifecycle.get_state("one") == "unloaded"
+
+
+# ---------- v1.1.1 批量操作原子性 ----------
+
+
+class LoadFailurePlugin(RecorderPlugin):
+    """load() 抛异常的插件。"""
+
+    def __init__(self, name: str, dependencies: list[str] | None = None) -> None:
+        super().__init__(name, dependencies)
+        self.error: BaseException = RuntimeError(f"{name} load 失败")
+
+    async def load(self, ctx: Any) -> None:
+        raise self.error
+
+
+class EnableFailurePlugin(RecorderPlugin):
+    """enable() 抛异常的插件。"""
+
+    def __init__(self, name: str, dependencies: list[str] | None = None) -> None:
+        super().__init__(name, dependencies)
+        self.error: BaseException = RuntimeError(f"{name} enable 失败")
+
+    async def enable(self) -> None:
+        raise self.error
+
+
+async def test_load_failure_rolls_back_previous_plugins(app: App):
+    """load 中途失败：已加载插件被逆序卸载，无状态残留。"""
+    received: list = []
+
+    class BusyPlugin(RecorderPlugin):
+        async def load(self, ctx: Any) -> None:
+            await super().load(ctx)
+            ctx.on("tick", lambda d: received.append(d))
+            ctx.provide("svc", 42)
+
+    good = BusyPlugin("good")
+    # 依赖 good 保证拓扑序：good 先加载，bad 的 load 再失败
+    bad = LoadFailurePlugin("bad", dependencies=["good"])
+    with pytest.raises(RuntimeError):
+        await app.lifecycle.load_all([good, bad])
+
+    assert app.lifecycle.get_state("good") == "unloaded"
+    assert app.lifecycle.get_state("bad") == "unloaded"
+    assert app.bus.count() == 0
+    assert app.registry.list() == []
+    assert good.calls == ["load", "unload"]
+
+    # 半加载状态被完全清理 -> 可以重新加载
+    await app.lifecycle.load_all([make_plugin("good")])
+    assert app.lifecycle.get_state("good") == "loaded"
+
+
+async def test_load_failure_rollback_reverse_order(app: App):
+    """load 失败回滚按逆加载序：依赖方先于依赖项被卸载。"""
+    events: list[str] = []
+    db = make_plugin("db")
+    api = make_plugin("api", dependencies=["db"])
+    broken = LoadFailurePlugin("broken", dependencies=["api"])
+    for p in (db, api, broken):
+        original = p.unload
+        p.unload = lambda _p=p, _orig=original: events.append(f"unload:{_p.name}") or _orig()  # type: ignore[method-assign]
+
+    # 加载序 db -> api -> broken，失败后逆序卸载
+    with pytest.raises(RuntimeError):
+        await app.lifecycle.load_all([db, api, broken])
+
+    assert events == ["unload:broken", "unload:api", "unload:db"]
+
+
+async def test_load_failure_rollback_error_aggregates(app: App):
+    """load 失败且回滚清理也失败：抛聚合 RollbackError，cause 指向原始异常。"""
+    good = make_plugin("good")
+
+    class BadCleanupPlugin(LoadFailurePlugin):
+        async def load(self, ctx: Any) -> None:
+            # 抛异常前登记一个会失败的 cleanup，污染回滚
+            ctx.on_cleanup(_raise_cleanup_error)
+            raise self.error
+
+    bad = BadCleanupPlugin("bad", dependencies=["good"])
+    with pytest.raises(RollbackError) as info:
+        await app.lifecycle.load_all([good, bad])
+
+    assert info.value.__cause__ is bad.error  # cause 指向原始 load 异常
+    # errors 只装清理失败项，不含原始 load 异常
+    assert [str(e) for e in info.value.errors] == ["清理失败"]
+    # good 仍被卸载
+    assert app.lifecycle.get_state("good") == "unloaded"
+
+
+async def test_enable_failure_rolls_back_all(app: App):
+    """enable 中途失败：已启用插件走 disable + unload，全部回到 unloaded。"""
+    plugin = make_plugin("ok")
+    # 依赖 ok 保证 ok 先启用，bad 的 enable 再失败
+    bad = EnableFailurePlugin("bad", dependencies=["ok"])
+    with pytest.raises(RuntimeError):
+        await app.lifecycle.load_all([plugin, bad])
+        await app.lifecycle.enable_all()
+
+    assert app.lifecycle.get_state("ok") == "unloaded"
+    assert app.lifecycle.get_state("bad") == "unloaded"
+    assert plugin.calls == ["load", "enable", "disable", "unload"]
+    # 失败后可重新加载启用
+    await app.lifecycle.load_all([make_plugin("ok")])
+    await app.lifecycle.enable_all()
+    assert app.lifecycle.get_state("ok") == "enabled"
+
+
+async def test_load_all_rollback_on_cancellation(app: App):
+    """load 被取消（CancelledError）也触发回滚，不留半加载状态。"""
+    good = make_plugin("good")
+
+    class CancelledPlugin(LoadFailurePlugin):
+        def __init__(self, name: str, dependencies: list[str] | None = None) -> None:
+            super().__init__(name, dependencies)
+            self.error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await app.lifecycle.load_all([good, CancelledPlugin("cancel", dependencies=["good"])])
+
+    assert app.lifecycle.get_state("good") == "unloaded"
+    assert app.lifecycle.get_state("cancel") == "unloaded"
+
+
+async def test_unload_all_continues_after_disable_hook_failure(app: App):
+    """unload_all 中 disable 钩子抛异常：聚合上报，不阻断其余插件卸载。"""
+    good = make_plugin("good")
+    bad = make_plugin("bad", dependencies=["good"])
+
+    def bad_disable() -> None:
+        raise RuntimeError("disable 失败")
+
+    bad.disable = bad_disable  # type: ignore[method-assign]
+
+    await app.lifecycle.load_all([good, bad])
+    await app.lifecycle.enable_all()
+
+    with pytest.raises(RollbackError) as info:
+        await app.lifecycle.unload_all()
+
+    assert [str(e) for e in info.value.errors] == ["disable 失败"]
+    # good 不被 bad 的失败阻断
+    assert app.lifecycle.get_state("good") == "unloaded"
+    # bad 的 disable 未完成，状态卡在 enabled（单插件语义不变）
+    assert app.lifecycle.get_state("bad") == "enabled"
+
+
+def _raise_cleanup_error():
+    raise RuntimeError("清理失败")
 
 
 def _noop():

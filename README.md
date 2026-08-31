@@ -1,13 +1,16 @@
-# Anima (v1.1)
+# Anima (v1.1.1)
 
 Anima 是一个零外部依赖的 Python 插件内核：插件生命周期管理、事件总线、
 服务注册表与副作用自动回滚，全部基于标准库实现。
 
-- **内核规模**: `anima/core/` 共 785 行，仅依赖标准库
-- **测试**: 113 个单元/集成/性能/压力测试，行覆盖率 99%（各模块 ≥97%）
+- **内核规模**: `anima/core/` 共 841 行，仅依赖标准库
+- **测试**: 123 个单元/集成/性能/压力测试，行覆盖率 99%（各模块 ≥97%）
 - **Python**: >= 3.11
 - **v1.1 新增**: `Context.task()` / `EffectTracker.push_task()` 后台任务
   卸载自动取消；EventBus 线程语义文档化。详见 [docs/CHANGELOG.md](docs/CHANGELOG.md)
+- **v1.1.1 修复**: 批量生命周期原子回滚（load/enable 失败不留半加载状态）、
+  `unload_all` 失败聚合不中断、EventBus 顺序契约明确。详见
+  [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ## 快速开始
 
@@ -95,7 +98,7 @@ unloaded ──load──> loaded ──enable──> enabled
 ```
 anima/
 ├── __init__.py
-└── core/               # 内核（纯标准库，735 行）
+└── core/               # 内核（纯标准库，841 行）
     ├── __init__.py     # 公共 API 导出
     ├── app.py          # App 组装器
     ├── bus.py          # EventBus 事件总线
@@ -106,7 +109,7 @@ anima/
     ├── plugin.py       # Plugin 抽象基类
     └── exceptions.py   # 异常体系
 tests/
-└── test_core/          # 104 个测试（覆盖率 99%）
+└── test_core/          # 123 个测试（覆盖率 99%）
 docs/
 ├── CHANGELOG.md        # 变更记录
 ├── core_api.md         # 接口签名

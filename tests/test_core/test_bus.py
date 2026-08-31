@@ -183,3 +183,17 @@ def test_emit_coroutine_handler_without_loop():
 
     bus.subscribe("evt", handler)
     bus.emit("evt", None)  # 无运行中的事件循环 -> 静默
+
+
+def test_handler_order_contract(bus: EventBus):
+    """顺序契约：精确 handler 先于通配 handler，组内按注册顺序。"""
+    calls: list[str] = []
+    bus.subscribe("evt.click", lambda d: calls.append("exact-1"))
+    bus.subscribe("evt.*", lambda d: calls.append("wild-1"))
+    bus.subscribe("evt.click", lambda d: calls.append("exact-2"))
+    bus.subscribe("*", lambda d: calls.append("wild-2"))
+    bus.subscribe("evt.*", lambda d: calls.append("wild-3"))
+
+    bus.emit("evt.click", None)
+
+    assert calls == ["exact-1", "exact-2", "wild-1", "wild-2", "wild-3"]

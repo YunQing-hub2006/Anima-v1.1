@@ -27,7 +27,7 @@ python -m venv .venv
 ## 2. 仓库地图
 
 ```
-anima/core/            内核（735 行，纯标准库，接口已冻结）
+anima/core/            内核（841 行，纯标准库，接口已冻结）
   app.py               组装器：start/stop、effects 持有者
   bus.py               事件总线：_exact dict + _wild 列表
   registry.py          服务注册表
@@ -36,7 +36,7 @@ anima/core/            内核（735 行，纯标准库，接口已冻结）
   effects.py           LIFO 副作用栈
   plugin.py            插件 ABC
   exceptions.py        异常体系
-tests/test_core/       104 个测试，12 个文件，按被测模块命名
+tests/test_core/       123 个测试，12 个文件，按被测模块命名
   conftest.py          bus/registry/effects/app fixtures + RecorderPlugin
   test_performance.py  性能基准（阈值 = 目标值 x5 安全系数）
   test_edge_cases.py   边界 + 压力
@@ -79,6 +79,9 @@ pyproject.toml         pytest/coverage 配置
 ### bus.py
 - 通配语义固定：`"user.*"` 匹配以 `"user."` 开头的一切、不匹配裸 `"user"`；
   `"*"` 匹配一切。改匹配规则属破坏性变更。
+- **顺序契约（v1.1.1 锁定）**：精确 handler 先于通配 handler，组内按
+  注册顺序——由 `test_handler_order_contract` 锁死。若引入真正的优先级
+  排序，必须先过该测试再显式设计；`_wild_matches` 内不再有任何排序。
 - 新增订阅结构时同步维护 `count()`/`clear()`，`App.stop` 的"bus 为空"
   验收依赖 `count()` 正确。
 - emit 的异常隔离必须保持：改 handler 调度时先读 `test_handler_exception_isolation`。
@@ -100,8 +103,16 @@ pyproject.toml         pytest/coverage 配置
   破坏性变更，先评审。
 - 校验（空名/重名/依赖）必须保持在 `load_all` 最前、任何 `plugin.load()`
   之前执行 -- 这是"插件不会观察到半加载状态"的保证。
-- 卸载错误语义：异常聚合抛出但状态推进到 unloaded。若要改成"失败即中止
-  卸载"，会破坏 `unload_all` 的完整性，属重大变更。
+- **批量原子性（v1.1.1 锁定）**：`load_all`/`enable_all` 失败时按逆
+  加载序回滚卸载全部已注册插件，由 `test_load_failure_rolls_back_previous_plugins`
+  / `test_enable_failure_rolls_back_all` 锁死。回滚自身的清理失败聚合进
+  `RollbackError`（cause 指向原始异常），契约由
+  `test_load_failure_rollback_error_aggregates` 锁死；`CancelledError`
+  也触发回滚（`test_load_all_rollback_on_cancellation`）。
+- 卸载错误语义：异常聚合抛出但状态推进到 unloaded；`unload_all` 中
+  单插件失败不中断其余（`test_unload_all_continues_after_cleanup_failure`
+  / `test_unload_all_continues_after_disable_hook_failure`）。若改成
+  "失败即中止卸载"，会破坏 `unload_all` 的完整性，属重大变更。
 
 ### context.py / app.py
 - Context **除 `task` 外**全部方法返回 `self`；新增方法默认返回 `self`
@@ -111,6 +122,12 @@ pyproject.toml         pytest/coverage 配置
   不要改成拷贝。
 - `App.start` 防重入、`stop` 幂等可重启，两条测试
   （`test_app_double_start_raises` / `test_app_restartable`）锁死该行为。
+- **v1.1.1 start/stop 错误语义**：start 失败后兜底清空可重试
+  （`test_app_start_load_failure_is_recoverable` /
+  `test_app_start_enable_failure_is_recoverable`）；stop 的清理兜底与
+  `_started` 复位由 try/finally 保证（`test_unload_all_continues_after_cleanup_failure`）。
+  不要移除 `start` 的 except 兜底或 `stop` 的 finally——那会让失败后
+  的 App 重新不可重启。
 - **v1.1 `Context.task` 无事件循环时抛 RuntimeError**（与 bus 协程 handler
   调度语义一致），由 `test_context_task_without_loop_raises` 锁死；不要改成
   隐式建循环，那会让线程归属变模糊。
