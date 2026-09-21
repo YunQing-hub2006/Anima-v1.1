@@ -7,6 +7,11 @@ import asyncio
 from anima.core.bus import EventBus
 
 
+def _boom_hook(event, handler, exc) -> None:
+    """上报钩子自身抛异常——用于验证异常隔离不被钩子打破。"""
+    raise RuntimeError("钩子也崩了")
+
+
 def test_subscribe_emit(bus: EventBus):
     """精确事件订阅与发布。"""
     received: list = []
@@ -138,6 +143,99 @@ async def test_emit_schedules_coroutine_handler():
     bus.subscribe("evt", handler)
     bus.emit("evt", None)
     await asyncio.wait_for(done.wait(), timeout=1)
+
+
+def test_error_hook_receives_handler_exception():
+    """on_error 钩子收到 (事件名, handler, 异常)，异常本身仍被隔离。"""
+    seen: list = []
+    bus = EventBus(on_error=lambda ev, h, exc: seen.append((ev, h, exc)))
+    good: list = []
+
+    def bad(_):
+        raise RuntimeError("handler 崩了")
+
+    bus.subscribe("evt", bad)
+    bus.subscribe("evt", lambda d: good.append(d))
+    bus.emit("evt", 42)
+
+    assert good == [42]  # 隔离不变式保持
+    assert len(seen) == 1
+    assert seen[0][0] == "evt"
+    assert seen[0][1] is bad
+    assert isinstance(seen[0][2], RuntimeError)
+
+
+def test_error_hook_covers_emit_async_sync_handler():
+    """emit_async 的同步 handler 异常同样经钩子上报。"""
+    seen: list = []
+    bus = EventBus(on_error=lambda ev, h, exc: seen.append(exc))
+
+    def bad(_):
+        raise ValueError("sync boom")
+
+    bus.subscribe("evt", bad)
+    assert bus.emit_async("evt", 1) == []
+    assert len(seen) == 1
+    assert isinstance(seen[0], ValueError)
+
+
+def test_set_error_hook_replaces_and_clears():
+    """set_error_hook 可替换钩子；None 恢复默认（不再回调旧钩子）。"""
+    seen: list = []
+    bus = EventBus(on_error=lambda ev, h, exc: seen.append("first"))
+    bus.set_error_hook(lambda ev, h, exc: seen.append("second"))
+
+    def bad(_):
+        raise RuntimeError("boom")
+
+    bus.subscribe("evt", bad)
+    bus.emit("evt", None)
+    assert seen == ["second"]
+
+    bus.set_error_hook(None)
+    bus.emit("evt", None)  # 走默认 logger 上报，不回调旧钩子
+    assert seen == ["second"]
+
+
+def test_error_hook_failure_does_not_escape():
+    """钩子自己抛异常也不得从 emit 漏给发布方。"""
+    bus = EventBus(on_error=_boom_hook)
+    seen: list = []
+    bus.subscribe("evt", lambda d: seen.append(d))
+
+    def bad(_):
+        raise RuntimeError("handler 崩了")
+
+    bus.subscribe("evt", bad)
+    bus.emit("evt", 1)
+    assert seen == [1]
+
+
+async def test_error_hook_failure_does_not_escape_emit_async():
+    """emit_async 路径同样不让钩子异常外泄。"""
+    bus = EventBus(on_error=_boom_hook)
+
+    def bad(_):
+        raise RuntimeError("handler 崩了")
+
+    bus.subscribe("evt", bad)
+    assert bus.emit_async("evt", 1) == []
+
+
+def test_default_error_reporting_uses_anima_logger(caplog):
+    """未提供钩子时默认写 anima.bus logger（可观测性默认开启）。"""
+    import logging
+
+    bus = EventBus()
+
+    def bad(_):
+        raise RuntimeError("handler 崩了")
+
+    bus.subscribe("evt", bad)
+    with caplog.at_level(logging.ERROR, logger="anima.bus"):
+        bus.emit("evt", None)
+    assert any(r.name == "anima.bus" for r in caplog.records)
+    assert any("handler 崩了" in (r.exc_text or "") for r in caplog.records)
 
 
 def test_clear_removes_all(bus: EventBus):

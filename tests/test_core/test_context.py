@@ -50,6 +50,27 @@ def test_context_config_missing_section_gets_empty_dict():
     assert app.config["plugins"]["fresh"] is ctx.config
 
 
+def test_context_config_tolerates_none_plugins_section():
+    """app.config["plugins"] 为 None（如 YAML 空节）时不崩溃。"""
+    app = App()
+    app.config["plugins"] = None  # type: ignore[assignment]
+
+    ctx = _make_ctx(app, RecorderPlugin("from-none"))
+    assert ctx.config == {}
+    assert app.config["plugins"] == {"from-none": {}}
+    assert app.config["plugins"]["from-none"] is ctx.config
+
+
+def test_context_config_replaces_non_dict_section():
+    """插件名下的配置切片不是 dict 时被替换为空 dict。"""
+    app = App()
+    app.config["plugins"]["broken"] = "not-a-dict"  # type: ignore[assignment]
+
+    ctx = _make_ctx(app, RecorderPlugin("broken"))
+    assert ctx.config == {}
+    assert app.config["plugins"]["broken"] is ctx.config
+
+
 def test_context_config_uses_existing_section():
     """已有配置切片被原样引用（start 前注入的配置对插件可见）。"""
     app = App()
@@ -205,3 +226,4 @@ def test_context_task_without_loop_raises(app: App):
     with pytest.raises(RuntimeError):
         ctx.task(coro)
     coro.close()
+

@@ -11,6 +11,7 @@ from anima.core.app import App
 from anima.core.context import Context
 from anima.core.exceptions import DependencyError, LifecycleError, RollbackError
 from anima.core.lifecycle import LifecycleManager
+from anima.core.plugin import Plugin
 from tests.test_core.conftest import RecorderPlugin, make_plugin
 
 
@@ -95,6 +96,75 @@ async def test_missing_dependency_detection(app: App):
     with pytest.raises(DependencyError):
         await app.lifecycle.load_all([a])
     assert a.calls == []
+
+
+async def test_circular_dependency_error_reports_actual_cycle(app: App):
+    """环报告只列真实环成员，不含仅被环拖累的下游插件。"""
+    a = make_plugin("a", dependencies=["b"])
+    b = make_plugin("b", dependencies=["a"])
+    downstream = make_plugin("downstream", dependencies=["a"])
+
+    # 列表顺序即 DFS 起点顺序：先走无环的 downstream，再命中真实环
+    with pytest.raises(DependencyError) as info:
+        await app.lifecycle.load_all([downstream, a, b])
+
+    message = str(info.value)
+    assert "a -> b -> a" in message
+    # 旧实现会把 downstream 一起报成"涉及插件"，误导排查方向
+    assert "downstream" not in message
+    assert downstream.calls == []
+
+
+async def test_circular_dependency_three_node_cycle_path(app: App):
+    """三元环报告为闭合路径 a -> b -> c -> a。"""
+    with pytest.raises(DependencyError) as info:
+        await app.lifecycle.load_all(
+            [
+                make_plugin("a", dependencies=["c"]),
+                make_plugin("b", dependencies=["a"]),
+                make_plugin("c", dependencies=["b"]),
+            ]
+        )
+
+    nodes = str(info.value).split(": ", 1)[1].split(" -> ")
+    assert len(nodes) == 4
+    assert nodes[0] == nodes[-1]
+    assert set(nodes) == {"a", "b", "c"}
+
+
+async def test_unload_all_survives_cancelled_background_task(app: App):
+    """插件先自行取消了后台任务，卸载仍须继续，不得困住其他插件。"""
+    unloaded: list[str] = []
+
+    class TaskOwner(Plugin):
+        name = "task-owner"
+
+        async def load(self, ctx: Context) -> None:
+            async def loop() -> None:
+                await asyncio.sleep(60)
+
+            self.task = ctx.task(loop())
+
+    class Follower(Plugin):
+        name = "follower"
+
+        async def load(self, ctx: Context) -> None:
+            ...
+
+        async def unload(self) -> None:
+            unloaded.append("follower")
+
+    owner = TaskOwner()
+    await app.start([owner, Follower()])
+    await asyncio.sleep(0)
+
+    owner.task.cancel()
+    while not owner.task.done():
+        await asyncio.sleep(0)
+
+    await app.stop()  # 修复前：CancelledError 打断整条卸载链
+    assert unloaded == ["follower"]
+    assert app.lifecycle.get_state("follower") == "unloaded"
 
 
 async def test_unload_reverses_load_order(app: App):
@@ -409,3 +479,4 @@ def _raise_cleanup_error():
 def _noop():
     """供 lambda 排序钩子返回的空协程占位。"""
     return None
+

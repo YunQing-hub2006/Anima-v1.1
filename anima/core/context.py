@@ -32,7 +32,12 @@ class Context:
         self.app = app
         self.plugin = plugin
         self.effects = app.effects_for(plugin.name)
-        plugins_cfg = app.config.setdefault("plugins", {})
+        plugins_cfg = app.config.get("plugins")
+        if not isinstance(plugins_cfg, dict):
+            # 容忍 ``{"plugins": None}``（例如从 YAML 加载到空节）等
+            # 非字典配置，避免在构造 Context 时抛 AttributeError。
+            plugins_cfg = {}
+            app.config["plugins"] = plugins_cfg
         section = plugins_cfg.get(plugin.name)
         if not isinstance(section, dict):
             section = {}

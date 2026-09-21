@@ -1,8 +1,8 @@
-# Anima 内核 API 参考（v1.1.1，已冻结）
+# Anima 内核 API 参考（v1.1.2，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
-> v1.1.1 变更摘要见文末"变更记录"。
+> v1.1.2 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -25,23 +25,36 @@ RollbackError.__cause__                     # 指向第一个子异常
 class Plugin(ABC):
     name: str                                    # 唯一标识，非空
     version: str = "1.0.0"
-    dependencies: list[str] = []                 # 依赖插件的 name
+    dependencies: ClassVar[Sequence[str]] = ()   # 依赖插件的 name（v1.1.2）
 
     @abstractmethod
     async def load(self, ctx: Context) -> None   # 只注册自己
     async def enable(self) -> None               # 可安全 use() 依赖
-    async def disable(self) -> None              # 默认空操作
+    async def disable(self) -> None              # 停止对外活动；**不回滚副作用**
     async def unload(self) -> None               # 自定义清理；默认空操作
 ```
 
 enable/disable/unload 允许子类写成同步 `def`，内核统一调度。
 
+`dependencies` 的默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
+v1.1.2 起）：旧实现用 `list[str] = []` 作类属性，所有子类共享同一个
+list，任何 `self.dependencies.append(...)` 会污染全局。子类照旧可赋值
+list 或 tuple。
+
+`disable()` 的语义（v1.1.2 明确）：**副作用不回滚**——`ctx.on` /
+`ctx.provide` 登记的订阅与注册保留到 `unload()`，禁用期间事件仍会投递
+到本插件的 handler，是否响应由插件自己的状态位决定。回滚只发生在
+`unload()`。
+
 ## 事件总线 — `bus.py`
 
 ```python
 Handler = Callable[[Any], Any]
+ErrorHook = Callable[[str, Handler, BaseException], None]        # v1.1.2
 
 class EventBus:
+    def __init__(self, on_error: ErrorHook | None = None)        # v1.1.2
+    def set_error_hook(self, hook: ErrorHook | None) -> None     # v1.1.2
     def subscribe(self, event: str, handler: Handler) -> None
     def unsubscribe(self, event: str, handler: Handler) -> None   # 幂等
     def emit(self, event: str, data: Any = None) -> None          # 异常隔离
@@ -56,6 +69,13 @@ class EventBus:
 执行顺序契约（v1.1.1 明确）：**精确订阅的 handler 先于通配 handler 执行，
 两组各自内部按注册顺序执行**。同步 handler 立即执行；协程 handler 的
 执行时机由事件循环调度决定，与注册顺序无关。
+
+异常上报契约（v1.1.2 新增）：handler 抛出的异常依旧**隔离**——不向
+`emit` / `emit_async` 的调用方传播，也不影响同事件的其他 handler；但会
+交给 `on_error` 钩子上报，未提供钩子时默认写 `anima.bus` logger
+（`logger.error`）。**上报动作自身也受隔离保护**：钩子是用户代码，它
+抛异常时退回默认 logger，不会漏给发布方。`set_error_hook(None)` 恢复
+默认上报。
 
 ## 服务注册表 — `registry.py`
 
@@ -87,7 +107,10 @@ class EffectTracker:
 `push_task`（v1.1 新增）：登记后台任务，回滚时**取消并等待其真正
 结束**（先让出一个循环节拍保证协程体已启动，finally 能执行）；已
 完成的任务登记后 rollback 会 re-raise 其异常（进入 RollbackError
-聚合）；非 Future/Task 入参抛 `TypeError`。
+聚合）。已取消的任务（v1.1.2 明确）**直接跳过**：`await` 一个已取消的
+Task 会抛回 `CancelledError`，而 `rollback()` 只捕获 `Exception`
+（`CancelledError` 继承 `BaseException`），那会打断整条回滚链。非
+Future/Task 入参抛 `TypeError`。
 
 ## 插件上下文 — `context.py`
 
@@ -164,10 +187,28 @@ class App:
 抛出，但总线/注册表清空与 `_started` 复位由 try/finally 保证必然
 执行——App 始终可重启。
 
+## 日志出口 — `log.py`（v1.1.2）
+
+```python
+logger = logging.getLogger("anima")     # 子模块用 logger.getChild("bus") 派生
+```
+
+内核日志统一挂在 `anima` 命名空间下（当前唯一日志点是 `anima.bus` 的
+handler 异常上报）。内核遵循标准库的库作者约定：**不加 handler、不设
+级别**，配置权留给应用：
+
+```python
+import logging
+logging.getLogger("anima").setLevel(logging.DEBUG)
+```
+
+`log.py` 的 `logger` **不从** `anima.core` 导出（避免污染公共 API）；
+需要时按名字取 `logging.getLogger("anima")`。
+
 ## 公共导出 — `anima.core.__init__`
 
 `AnimaError, App, CleanupFn, Context, DependencyError, EffectTracker,
-EventBus, LifecycleError, LifecycleManager, Plugin, PluginState,
+ErrorHook, EventBus, LifecycleError, LifecycleManager, Plugin, PluginState,
 RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 
 ## 性能基准（实测，Windows / Python 3.13）
@@ -182,6 +223,22 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 | 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.1 KiB |
 
 ## 变更记录
+
+### v1.1.2（2026-09-08）
+
+正确性修复为主，公共签名**仅新增**（无破坏性变更）：
+
+- 循环依赖报错改为三色 DFS 回溯的真实环路路径（`a -> b -> a`），
+  不再把仅被环拖累的下游插件报成环成员。
+- `Plugin.dependencies` 默认值 `list[str] = []` ->
+  `ClassVar[Sequence[str]] = ()`（消除子类共享同一 list 的类属性坑）。
+- `disable()` 文档与实现对齐：**不回滚副作用**，回滚只发生在 `unload()`。
+- `Context.config` 容忍 `app.config["plugins"]` 为 `None` 或切片非 dict。
+- `push_task` 跳过已取消的任务，避免 `CancelledError` 打断整条卸载链。
+- 新增 `EventBus(on_error=...)` / `set_error_hook` / `ErrorHook`：handler
+  异常仍隔离，但默认写 `anima.bus` logger。
+- 新增 `anima/core/log.py`（`anima` logger 出口）与 `anima/py.typed`。
+- 规模 841 -> 961 行；测试 123 -> 136 个；覆盖率 99% 不变。
 
 ### v1.1.1（2026-08-21）
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import inspect
+from collections import deque
 from typing import TYPE_CHECKING
 
 from anima.core.context import Context
@@ -197,12 +198,11 @@ def _topo_sort(plugins: list[Plugin]) -> list[Plugin]:
             indegree[plugin.name] += 1
             dependents[dep].append(plugin.name)
 
-    queue = sorted(
-        (p.name for p in plugins if indegree[p.name] == 0),
-    )
+    # deque 而非 list：入队/出队是 Kahn 的高频操作，list.pop(0) 是 O(n)。
+    queue: deque[str] = deque(sorted(p.name for p in plugins if indegree[p.name] == 0))
     ordered: list[str] = []
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         ordered.append(current)
         for downstream in dependents[current]:
             indegree[downstream] -= 1
@@ -210,9 +210,44 @@ def _topo_sort(plugins: list[Plugin]) -> list[Plugin]:
                 queue.append(downstream)
 
     if len(ordered) != len(plugins):
-        cyclic = sorted(name for name, deg in indegree.items() if deg > 0)
-        raise DependencyError(f"检测到循环依赖，涉及插件: {', '.join(cyclic)}")
+        # 剩余节点 = 环成员 + 仅被环拖累的下游节点。直接列举它们会把
+        # 无关插件报成环成员、误导排查方向，因此回溯出真实环路。
+        cycle = _find_cycle(dependents)
+        raise DependencyError(f"检测到循环依赖: {' -> '.join(cycle)}")
     return [by_name[name] for name in ordered]
+
+
+def _find_cycle(dependents: dict[str, list[str]]) -> list[str]:
+    """回溯依赖图中的一个真实环路，返回首尾闭合的路径（如 ``a -> b -> a``）。
+
+    三色标记 DFS：命中灰色节点说明走到了当前搜索路径上的节点，从该节点
+    截断即得环路。该方法只在 :func:`_topo_sort` 判定"存在环"之后调用，
+    此时图中必有环；末行返回空列表仅为类型完备。
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = dict.fromkeys(dependents, WHITE)
+    path: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        color[node] = GRAY
+        path.append(node)
+        for downstream in dependents[node]:
+            if color[downstream] == GRAY:
+                return [*path[path.index(downstream) :], downstream]
+            if color[downstream] == WHITE:
+                found = visit(downstream)
+                if found is not None:
+                    return found
+        path.pop()
+        color[node] = BLACK
+        return None
+
+    for name in dependents:
+        if color[name] == WHITE:
+            found = visit(name)
+            if found is not None:
+                return found
+    return []  # pragma: no cover - 调用方已保证存在环路
 
 
 async def _call(method: Any, *args: Any) -> None:

@@ -27,16 +27,17 @@ python -m venv .venv
 ## 2. 仓库地图
 
 ```
-anima/core/            内核（841 行，纯标准库，接口已冻结）
+anima/core/            内核（961 行，纯标准库，接口已冻结；上限 1000）
   app.py               组装器：start/stop、effects 持有者
-  bus.py               事件总线：_exact dict + _wild 列表
+  bus.py               事件总线：_exact dict + _wild 列表 + 异常上报钩子
   registry.py          服务注册表
   lifecycle.py         校验 + Kahn 排序 + 状态机 + 卸载（最复杂，改动最谨慎）
   context.py           插件上下文（链式 API）
   effects.py           LIFO 副作用栈
   plugin.py            插件 ABC
   exceptions.py        异常体系
-tests/test_core/       123 个测试，12 个文件，按被测模块命名
+  log.py               日志出口（anima logger，v1.1.2）
+tests/test_core/       136 个测试，12 个文件，按被测模块命名
   conftest.py          bus/registry/effects/app fixtures + RecorderPlugin
   test_performance.py  性能基准（阈值 = 目标值 x5 安全系数）
   test_edge_cases.py   边界 + 压力
@@ -54,8 +55,9 @@ pyproject.toml         pytest/coverage 配置
 5. 每模块行覆盖率 >= 90%，新分支必须有对应用例。
 6. 任何 handler / cleanup 抛异常不得影响其他组件（异常隔离不变式）。
 7. `unregister` / `unsubscribe` 幂等（自动回滚路径依赖这一点）。
-8. `core/` 总行数 < 1000。加功能前先想能不能放到 `anima/plugins/` 或
-   `anima/utils/` -- 默认答案通常是"能"。
+8. `core/` 总行数 < 1000（v1.1.2 后**余量只剩 39 行**）。加功能前先想
+   能不能放到 `anima/plugins/` 或 `anima/utils/` -- 默认答案通常是“能”。
+   新增公共能力前**先估行数**，别等铁律检查失败才回头砍。
 
 ## 4. 开发流程（测试先行）
 
@@ -85,6 +87,24 @@ pyproject.toml         pytest/coverage 配置
 - 新增订阅结构时同步维护 `count()`/`clear()`，`App.stop` 的"bus 为空"
   验收依赖 `count()` 正确。
 - emit 的异常隔离必须保持：改 handler 调度时先读 `test_handler_exception_isolation`。
+- **v1.1.2 异常上报**：handler 异常依旧不上抛，但必须经 `_report` 走
+  `on_error` 钩子（默认 `anima.bus` logger）。**上报路径本身也不能抛**
+  ——钩子是用户代码。锁死用例：
+  `test_error_hook_receives_handler_exception`（emit 路径）、
+  `test_error_hook_covers_emit_async_sync_handler`（emit_async 的同步
+  handler 路径）、`test_error_hook_failure_does_not_escape` /
+  `..._emit_async`（钩子自身崩溃不得外泄）。
+- `EventBus.__init__` 的 `on_error` 与 `set_error_hook` 是 v1.1.2 新增
+  的可选能力；默认值 `None` 表示"用默认 logger 上报"，不要改成"静默"。
+
+### plugin.py
+- `dependencies` 默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
+  v1.1.2 起）。v1.1.1 及以前是 `list[str] = []`——类属性，所有子类共享
+  同一个 list，任何 `self.dependencies.append(...)` 会污染全局。锁死用例
+  `test_dependencies_default_is_immutable_and_unshared`，不要改回 list。
+- **生命周期文档即契约**：`disable()` 不回滚副作用，只有 `unload()` 回滚。
+  改这里必须同步 `architecture.md` §4.2 与 `core_api.md`（v1.1.2 修过一次
+  这种"文档与实现裂缝"）。
 
 ### registry.py / effects.py
 - `use()` 返回 default、`unregister` 幂等，这两个语义被 Context 与自动回滚
@@ -97,6 +117,13 @@ pyproject.toml         pytest/coverage 配置
   回归 `test_push_task_cancels_on_rollback` /
   `test_push_task_awaits_completion` 必须先过。非 Future 入参抛 TypeError
   的防御分支由 `test_push_task_rejects_non_task` 锁死。
+- **v1.1.2 已取消任务的不变式**：`push_task` 的 `_cancel_and_await` 必须
+  **跳过已取消的任务**。`await` 一个已取消的 Task 会抛回
+  `CancelledError`，而 `rollback()` 只捕获 `Exception`
+  （`CancelledError` 继承 `BaseException`），异常会逃出整条回滚栈与
+  `unload_all`——其余插件永不卸载。回归
+  `test_push_task_already_cancelled_keeps_rolling_back` /
+  `test_unload_all_survives_cancelled_background_task`。
 
 ### lifecycle.py
 - 状态机转换表集中在 `enable/disable/unload` 三个方法开头，改转换规则 =
@@ -109,6 +136,11 @@ pyproject.toml         pytest/coverage 配置
   `RollbackError`（cause 指向原始异常），契约由
   `test_load_failure_rollback_error_aggregates` 锁死；`CancelledError`
   也触发回滚（`test_load_all_rollback_on_cancellation`）。
+- **v1.1.2 环报告**：有环时 `_topo_sort` 用 `_find_cycle`（三色 DFS）
+  返回真实环路路径，消息形如 `检测到循环依赖: a -> b -> a`。**不要退回
+  到列举所有剩余节点**——那会把仅被环拖累的下游插件报成环成员，误导
+  排查方向。回归 `test_circular_dependency_error_reports_actual_cycle` /
+  `test_circular_dependency_three_node_cycle_path`。
 - 卸载错误语义：异常聚合抛出但状态推进到 unloaded；`unload_all` 中
   单插件失败不中断其余（`test_unload_all_continues_after_cleanup_failure`
   / `test_unload_all_continues_after_disable_hook_failure`）。若改成
@@ -117,7 +149,7 @@ pyproject.toml         pytest/coverage 配置
 ### context.py / app.py
 - Context **除 `task` 外**全部方法返回 `self`；新增方法默认返回 `self`
   且不抛业务异常。`task` 是 v1.1 的有意例外（返回 Task），见 ADR 9，
-  不要"顺手"改成链式。
+  不要“顺手”改成链式。
 - `config` 切片是引用共享（对 app.config 的修改插件可见）--这是特性不是 bug，
   不要改成拷贝。
 - `App.start` 防重入、`stop` 幂等可重启，两条测试
@@ -169,7 +201,7 @@ x 5（CI 抖动保护）。维护规则：
 
 | 症状 | 原因 | 排查 |
 |---|---|---|
-| `DependencyError: 检测到循环依赖` | 依赖图有环（含自依赖） | 检查各插件 `dependencies` 声明 |
+| `DependencyError: 检测到循环依赖: a -> b -> a` | 依赖图有环（含自依赖） | 报错串**就是环路路径**，按 `->` 逐个查各插件的 `dependencies` 声明 |
 | `LifecycleError: 插件重复注册` | 同名插件同批/跨批注册 | 检查 `Plugin.name` 唯一性 |
 | stop 后仍收到事件 | 绕过 `ctx.on` 直接 `bus.subscribe` | 订阅必须经 Context 才有自动回滚 |
 | stop 后服务仍存在 | 绕过 `ctx.provide` 直接 `registry.register` | 同上 |
@@ -213,3 +245,19 @@ class MyFeature(Plugin):
 
 记住三条：副作用一律经 `ctx.on/ctx.provide/ctx.on_cleanup` 登记；
 `use()` 只在 `enable` 及之后；不要在插件里持有 bus/registry 引用。
+
+## 11. 日志约定（v1.1.2）
+
+- 内核日志一律走 `anima/core/log.py` 的 `logger`（名字 `anima`），
+  子模块用 `logger.getChild("<模块名>")` 派生（当前只有 `anima.bus`）。
+- 内核**不加 handler、不设级别** -- 把配置权留给应用。调试时：
+
+  ```python
+  import logging
+  logging.getLogger("anima").setLevel(logging.DEBUG)
+  ```
+
+- 当前唯一的日志点：`EventBus._report`（handler 异常上报）。加新日志点
+  前先问"这是不是本来就该用异常上报"——`RollbackError.errors` 这类
+  诊断必须留在异常里，调用方要拿它，别把异常语义稀释成日志。
+- 不要在 `core/` 里 `logging.basicConfig(...)`：库不得接管应用的日志配置。

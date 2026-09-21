@@ -1,10 +1,11 @@
-# Anima 内核架构设计（v1.1）
+# Anima 内核架构设计（v1.1.2）
 
 > 本文是内核的正式架构设计文档，配合 [core_api.md](core_api.md)（接口签名）
 > 与 [maintenance.md](maintenance.md)（开发维护指南）使用。
 > 内核公共接口自 v1.0 起冻结，变更需走评审流程（见维护指南第 6 节）。
 > v1.1 相对 v1.0 仅新增接口（`push_task`/`Context.task`）与线程语义
-> 文档化，详见 core_api.md 变更记录。
+> 文档化，详见 core_api.md 变更记录。v1.1.2 为正确性修复 + 异常上报与
+> 日志出口，同属非破坏性变更。
 
 ---
 
@@ -13,9 +14,9 @@
 | 维度 | 目标 | 达成情况 |
 |---|---|---|
 | 依赖 | 零外部依赖，`core/` 只 import 标准库 | ✅ 由 `check_kernel_rules.py` 自动检查 |
-| 规模 | `core/` < 1000 行 | ✅ 785 行 |
+| 规模 | `core/` < 1000 行 | ✅ 961 行（余量 39，见 §10 预算告警） |
 | 类型 | 所有公共接口类型注解完整 | ✅ |
-| 测试 | 每模块行覆盖率 >= 90% | ✅ 总体 99%，最低模块 97% |
+| 测试 | 每模块行覆盖率 >= 90% | ✅ 总体 99%，最低模块 98% |
 | 性能 | 见第 8 节基准表 | ✅ 全部达标 |
 | 语义 | 插件"怎么活、怎么死、怎么通信"三件事 | — |
 
@@ -51,7 +52,6 @@
 依赖方向自上而下单向依赖；编排层内部 `App -> LifecycleManager -> Context`
 反向通过构造注入（`LifecycleManager(app)`）避免循环 import，
 跨模块类型引用一律走 `from __future__ import annotations` + `TYPE_CHECKING`。
-
 ## 3. 组件关系图
 
 ```
@@ -101,7 +101,11 @@ AnimaError
 - 类属性 `name / version / dependencies` 是**声明式元数据**，由内核在加载
   前统一校验，插件自身不参与校验。
 - 阶段契约：`load` 只注册自己（依赖可能未加载）；`enable` 可安全 `use()`
-  依赖；`disable/unload` 框架先自动回滚副作用。
+  依赖；`disable` 只停止对外活动（**副作用保留**）；`unload` 才由框架
+  统一回滚副作用（v1.1.2 修正：此前本文与 `plugin.py` 误称 disable 也
+  回滚，与 `LifecycleManager.disable()` 的实现不符）。
+- `dependencies` 默认值是**不可变元组** `()`（v1.1.2 起）：声明式元数据
+  不应让子类共享同一个可变 list。
 - 同步/异步统一：三个阶段方法允许子类写成 `def`，内核 `LifecycleManager._call`
   用 `inspect.isawaitable` 分派。
 
@@ -126,11 +130,15 @@ _wild:  list[tuple[prefix, Handler]]    # 通配订阅，emit 时线性扫描
 - `emit_async`：协程包装为 `Task` 返回，由调用方 `gather`；同步 handler
   仍立即执行。
 
+**异常上报（v1.1.2）**：异常隔离不等于静默。每个 handler 的异常在
+`except` 后交给 `_report`：有 `on_error` 钩子则用钩子，否则写
+`anima.bus` logger。`_report` 整体包在 try/except 内——钩子是用户
+代码，它崩了也只能写日志，绝不把异常漏给发布方。
+
 ### 4.4 registry.py — 服务注册表
 
 薄字典封装，三个关键语义：重复注册抛 `ServiceExistsError`（防止隐性覆盖）、
 `unregister` 幂等（与回滚路径配合，重复回滚安全）、`use` 返回实例本身不包装。
-
 ### 4.5 effects.py — 副作用追踪
 
 LIFO 栈 + 逐项回滚：
@@ -209,7 +217,8 @@ unloaded ──load──> loaded ──enable──> enabled
 
 | 场景 | 行为 | 理由 |
 |---|---|---|
-| 单个事件 handler 抛异常 | 吞掉，其他 handler 照常 | 发布方不应为订阅者买单 |
+| 单个事件 handler 抛异常 | **隔离**（不上抛），其他 handler 照常；经 `on_error` 上报（默认 `anima.bus` logger） | 发布方不应为订阅者买单，但也不该无声失败 |
+| `on_error` 上报钩子自身抛异常 | 隔离，退回默认 logger 上报 | 上报路径不得破坏 emit 的"永不失败"契约 |
 | 单个 cleanup 抛异常 | 继续回滚剩余项，最后聚合 | 回滚完整性 > 单项成功 |
 | `plugin.unload()` 抛异常 | 收集进 RollbackError，状态仍 unloaded | 不让坏插件卡死全局 |
 | 依赖缺失/循环 | 加载前抛 DependencyError | 插件代码执行前拦截 |
@@ -233,7 +242,10 @@ v1.1 的 `push_task` 把"取消并等待后台任务"作为一条普通 cleanup 
 复用 LIFO/异常聚合两条不变式。关键细节：cancel 请求若落在**从未启动**
 的协程上，协程体（含 finally）不会执行，因此回滚代码先 `await sleep(0)`
 让出一拍、保证协程进入函数体后再 cancel；任务自身的非 CancelledError
-异常进入 RollbackError 聚合，不阻断其他回滚。
+异常进入 RollbackError 聚合，不阻断其他回滚。**已取消的任务（v1.1.2
+明确）直接跳过**：`await` 一个已取消的 Task 会抛回 `CancelledError`，
+而 `rollback()` 只捕获 `Exception`，那会打断整条回滚链并让其余插件永不
+卸载。
 
 ---
 
@@ -319,15 +331,14 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 |---|---|---|
 | 精确事件 dict 索引 | O(1) 查找 | emit 平均 **3.2 µs**（目标 <100µs） |
 | 通配独立列表（非逐模式正则） | 扫描成本与订阅数线性 | 200 通配下精确事件不受影响 |
-| Kahn 排序 O(V+E)，入度数组 | 100 插件 **0.13 ms**（目标 <1ms） | |
-| 回滚为简单 pop 循环 | 1000 项 **1.3 ms**（目标 <10ms） | |
-| App 惰性创建 effects | 空 App 峰值 **0.8 KiB**（目标 <5MB） | |
-| 100 插件完整生命周期 | 全流程 **2.2 ms**（目标 <50ms） | |
+| Kahn 排序 O(V+E)，入度数组 | 100 插件 **0.13 ms**（目标 <1ms） |
+| 回滚为简单 pop 循环 | 1000 项 **1.3 ms**（目标 <10ms） |
+| App 惰性创建 effects | 空 App 峰值 **0.8 KiB**（目标 <5MB） |
+| 100 插件完整生命周期 | 全流程 **2.2 ms**（目标 <50ms） |
 
 注：计划中"1000 handler emit <0.1ms"按其"测 1000 次取平均"口径执行；
 1000-handler 单次 emit 作为压力项单独设 10ms 上限（实测 1.2ms）。
 基准脚本位于 `tests/test_core/test_performance.py`，阈值含 5 倍安全系数。
-
 ---
 
 ## 9. 设计决策记录（ADR 摘要）
@@ -365,6 +376,20 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
     从不内联执行），属死代码，已移除。契约写入 bus.py docstring 并以
     `test_handler_order_contract` 锁死，演进方向若引入真正的优先级
     排序需显式设计。
+12. **v1.1.2 handler 异常上报与隔离并存**：隔离的语义是"不上抛给发布
+    方"，不是"无声"。给 `EventBus` 加可选 `on_error` 钩子，默认写
+    `anima.bus` logger。为什么不直接把异常抛出去？见 §5.2 第 1 行——
+    发布方不应为订阅者买单。为什么钩子也要 try/except？因为它是用户
+    代码，一旦它抛异常，隔离就被从后门打破。
+13. **v1.1.2 `disable()` 语义按实现定稿**：`disable` **不回滚**副作用。
+    曾考虑让 disable 也回滚，但那要求 `enable` 重放订阅（把
+    EffectTracker 拆成"持久区/临时区"），API 复杂度显著上升，而收益
+    只是语义洁癖。最终选择修正文档而非改代码：disable = 停止主动做事，
+    unload = 卸下向内注册。
+14. **v1.1.2 循环依赖报错报"环"而非"剩余节点"**：Kahn 结束后入度仍 > 0
+    的节点包含"仅被环拖累"的下游插件。报出它们会把排查者引向无辜
+    插件，因此额外用三色 DFS 回溯一条真实环路，消息即
+    `a -> b -> a`。
 
 ---
 
@@ -378,5 +403,11 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 | 插件热重载 | 文件监听属 `anima/plugins/hotreload.py`，内核不需改动 | plugins/ |
 | 事件优先级/延迟 | handler 包装排序（v1.1.1 已移除 `_wild_matches` 内的不可观察排序钩子；真实优先级需显式设计执行顺序） | bus.py |
 | 条件启用 | config 切片加 `enabled: false` 约定 | lifecycle.py |
+
+> ⚠️ **行数预算告警（v1.1.2 起）**：内核已是 961/1000 行，余量仅 39 行。
+> 上表方向合计约 90 行（锁 + 优先级 + 采集 + 生命周期事件 + 热插拔），
+> **不可能一次性全部落进内核**。实施前必须先决策：精简 docstring、把
+> 非内核关注点移到 `anima/utils/`，或正式上调上限并同步修改
+> `check_kernel_rules.py` 与铁律第 8 条。
 
 任何演进若改动冻结接口，必须走第 6 节（维护指南）的变更评审流程。

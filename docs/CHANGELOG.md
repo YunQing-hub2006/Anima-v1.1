@@ -3,6 +3,89 @@
 所有显著变更记录于此文件。版本号遵循语义化版本规范；内核公共接口自
 v1.0 起冻结，任何破坏性变更需走 `maintenance.md` 第 6 节的评审流程。
 
+## [1.1.2] — 2026-09-08
+
+按外部评审的 P0/P1 清单修复正确性缺陷，并补上两项 P4 级工程化能力。
+公共签名**仅新增**（`EventBus.__init__` 增加可选参数、新增 `ErrorHook`
+与 `EventBus.set_error_hook`）；两处行为增强（`dependencies` 默认值、
+循环依赖报错文本）不触及既有调用契约，无破坏性变更。
+
+### 修复
+
+- **循环依赖报错只列真实环路（P0-5）**：`_topo_sort` 判定有环后改用
+  三色 DFS 回溯真实环路。消息从"涉及插件: a, b, downstream"（把仅被环
+  拖累的下游插件也报成环成员，误导排查方向）变为
+  "检测到循环依赖: a -> b -> a"。
+- **`dependencies` 默认值改为不可变元组（P0-1）**：`Plugin.dependencies`
+  由 `list[str] = []` 改为 `ClassVar[Sequence[str]] = ()`。旧默认值是
+  **类属性**，所有子类共享同一个 list，任何
+  `self.dependencies.append(...)` 都会污染全局；元组默认值从根上消除
+  这类静默 bug。子类照旧可赋值 list 或 tuple。
+- **`disable()` 文档与实现对齐（P0-2）**：`plugin.py` 与
+  `architecture.md` §4.2 原称"disable 时框架自动回滚副作用"，但
+  `LifecycleManager.disable()` 只调用钩子、**不回滚**——订阅与注册会
+  一直保留到 `unload()`。按**实现**修正文档（不改语义），并写明分工：
+  disable 停止"主动做事"，unload 才卸下"向内注册"的东西。
+- **`Context.config` 容忍非字典配置（P0-3）**：`app.config["plugins"]`
+  为 `None`（如 YAML 空节）时，原先在构造 Context 时抛
+  `AttributeError`；现按"缺省即空 dict"归一化。
+- **已取消的后台任务不再打断卸载（P1-4，实际严重度 P0）**：
+  `EffectTracker.push_task` 登记的任务若在回滚前已被取消，回滚中的
+  `await task` 会抛回 `CancelledError`；`rollback()` 只捕获
+  `Exception`，而 `CancelledError` 继承 `BaseException`，异常会一路
+  逃出 `unload_all`——**整条卸载链中断，其余插件永不卸载**。现在已取消
+  的任务直接跳过（视为正常收尾），其余已结束任务照旧 re-raise 进
+  `RollbackError` 聚合。
+- **拓扑排序改用 deque（P0-4）**：Kahn 排序的 `list.pop(0)` 是 O(n)，
+  改为 `collections.deque.popleft()`。
+
+### 新增
+
+- **`EventBus(on_error=...)` / `EventBus.set_error_hook(hook)`（P1-1）**：
+  handler 异常依旧**隔离**（不上抛给发布方，架构 §5.2 语义不变），但不再
+  无声——交给 `ErrorHook = Callable[[str, Handler, BaseException], None]`
+  上报；未提供钩子时默认写 `anima.bus` logger。**上报动作本身也遵守
+  异常隔离**：钩子自己抛异常时退回默认 logger，绝不让异常从 `emit` 漏出。
+- **`anima/core/log.py`（P4-3）**：内核统一日志出口
+  `logging.getLogger("anima")`，子模块用 `getChild` 派生（如
+  `anima.bus`）。遵循标准库库作者约定：不加 handler、不设级别，配置权
+  留给应用。
+- **`anima/py.typed` + `[tool.setuptools.package-data]`（P4-1）**：
+  PEP 561 标记，mypy / pyright 开始读取本包内联注解。
+- **`ErrorHook` 从 `anima.core` 导出**。
+
+### 其他
+
+- `pyproject.toml` 的 `version` 由 `1.0.0` 修正为 `1.1.2`（此前长期与
+  `anima.core.__version__` 不一致）。
+
+### 文档
+
+- `architecture.md`：§4.2 disable 语义修正、§4.3 总线异常上报、§5.2 异常
+  策略表补行、ADR 12/13/14、§10 演进表更新。
+- `core_api.md`：`Plugin.dependencies` 新签名、`EventBus` 错误钩子、
+  日志出口、变更记录。
+- `maintenance.md`：模块地图与行数、bus/effects/plugin 逐模块不变式与
+  锁定测试名、新增日志约定一节。
+- `README.md`：版本、规模、测试数与本版要点。
+
+### 验收
+
+- 规模 841 -> **961 行**（目标 <1000，余量 39 行）
+- 测试 123 -> **136 个**（+13：bus 错误钩子 6、lifecycle 环报告 3、
+  context 配置边界 2、plugin 不可变默认值 1、effects 已取消任务 1）
+- 覆盖率 **99%** 不变（lifecycle 98%；未覆盖 3 行仍是 v1.0 起的历史缺口）
+- `check_kernel_rules.py` 通过：纯标准库、无第三方 import
+- 新增用例已做"回退源码"验证：12 个新用例在 v1.1.1 基线上 11 个失败，
+  第 12 个（`test_context_config_replaces_non_dict_section`）守护的是
+  v1.1.1 就已存在的分支
+
+> ⚠️ **行数余量告警**：内核从 841 行升到 961 行，余量由 159 行降到
+> 39 行。评审清单里剩余 P2/P3 项（事件优先级、`emit_collect`、生命周期
+> 事件、单插件热插拔、服务接口校验等）合计约 90 行，**直接实施会突破
+> 1000 行铁律**。动手前必须先决策：精简 docstring、把非内核关注点移到
+> `anima/utils/`，或正式上调行数上限。
+
 ## [1.1.1] — 2026-08-21
 
 三项缺陷修复（公共签名不变；批量操作的**错误时行为**有语义增强，

@@ -1,16 +1,22 @@
-# Anima (v1.1.1)
+# Anima (v1.1.2)
 
 Anima 是一个零外部依赖的 Python 插件内核：插件生命周期管理、事件总线、
 服务注册表与副作用自动回滚，全部基于标准库实现。
 
-- **内核规模**: `anima/core/` 共 841 行，仅依赖标准库
-- **测试**: 123 个单元/集成/性能/压力测试，行覆盖率 99%（各模块 ≥97%）
+- **内核规模**: `anima/core/` 共 961 行（上限 1000），仅依赖标准库
+- **测试**: 136 个单元/集成/性能/压力测试，行覆盖率 99%（各模块 ≥98%）
 - **Python**: >= 3.11
+- **PEP 561**: 自带 `anima/py.typed`，mypy / pyright 可直接读取内联类型
 - **v1.1 新增**: `Context.task()` / `EffectTracker.push_task()` 后台任务
   卸载自动取消；EventBus 线程语义文档化。详见 [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - **v1.1.1 修复**: 批量生命周期原子回滚（load/enable 失败不留半加载状态）、
   `unload_all` 失败聚合不中断、EventBus 顺序契约明确。详见
   [docs/CHANGELOG.md](docs/CHANGELOG.md)
+- **v1.1.2 修复**: 循环依赖报错只列**真实环路**（`a -> b -> a`）、
+  `disable()` 文档与实现对齐（它**不回滚**副作用）、非字典配置切片不再
+  崩溃、`dependencies` 默认值改为不可变元组、已取消的后台任务不再
+  打断整条卸载链；新增 handler 异常上报钩子（`EventBus(on_error=...)`，
+  默认写 `anima` logger）。详见 [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ## 快速开始
 
@@ -75,6 +81,7 @@ asyncio.run(main())
 | `Context` | `anima/core/context.py` | 插件视角的链式 API |
 | `EffectTracker` | `anima/core/effects.py` | LIFO 副作用栈，卸载时自动回滚 |
 | `LifecycleManager` | `anima/core/lifecycle.py` | Kahn 拓扑排序 + 状态机 |
+| `logger` | `anima/core/log.py` | `anima` 命名空间日志出口（v1.1.2） |
 
 ### 生命周期状态机
 
@@ -86,8 +93,9 @@ unloaded ──load──> loaded ──enable──> enabled
 ```
 
 - `load()`: 只注册自己；`enable()`: 可安全使用依赖
-- 卸载按**逆拓扑顺序**执行，全部副作用（事件订阅、服务注册、自定义清理）自动回滚
-- 循环/缺失依赖在加载前即抛 `DependencyError`
+- `disable()`: 停止对外活动，**不回滚副作用**（订阅与注册保留到 unload）
+- 卸载按**逆拓扑顺序**执行，全部副作用（事件订阅、服务注册、后台任务、自定义清理）自动回滚
+- 循环/缺失依赖在加载前即抛 `DependencyError`（有环时消息直接给出环路路径）
 
 ### 插件配置
 
@@ -98,7 +106,7 @@ unloaded ──load──> loaded ──enable──> enabled
 ```
 anima/
 ├── __init__.py
-└── core/               # 内核（纯标准库，841 行）
+└── core/               # 内核（纯标准库，961 行 / 上限 1000）
     ├── __init__.py     # 公共 API 导出
     ├── app.py          # App 组装器
     ├── bus.py          # EventBus 事件总线
@@ -107,9 +115,11 @@ anima/
     ├── context.py      # Context 插件上下文
     ├── effects.py      # EffectTracker 副作用追踪
     ├── plugin.py       # Plugin 抽象基类
-    └── exceptions.py   # 异常体系
+    ├── exceptions.py   # 异常体系
+    └── log.py          # 日志出口（anima logger，v1.1.2）
+├── py.typed            # PEP 561 标记（v1.1.2）
 tests/
-└── test_core/          # 123 个测试（覆盖率 99%）
+└── test_core/          # 136 个测试（覆盖率 99%）
 docs/
 ├── CHANGELOG.md        # 变更记录
 ├── core_api.md         # 接口签名

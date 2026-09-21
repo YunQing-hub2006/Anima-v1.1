@@ -19,7 +19,7 @@
 """
 
 from anima.core.app import App
-from anima.core.bus import EventBus
+from anima.core.bus import ErrorHook, EventBus
 from anima.core.context import Context
 from anima.core.effects import CleanupFn, EffectTracker
 from anima.core.exceptions import (
@@ -41,6 +41,7 @@ __all__ = [
     "Context",
     "DependencyError",
     "EffectTracker",
+    "ErrorHook",
     "EventBus",
     "LifecycleError",
     "LifecycleManager",
@@ -52,4 +53,4 @@ __all__ = [
     "ServiceRegistry",
 ]
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"

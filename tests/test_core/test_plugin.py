@@ -50,7 +50,7 @@ def test_plugin_attributes():
     plugin = MinimalPlugin()
     assert plugin.name == "minimal"
     assert plugin.version == "1.0.0"
-    assert plugin.dependencies == []
+    assert plugin.dependencies == ()
 
     class Versioned(Plugin):
         name = "versioned"
@@ -90,7 +90,27 @@ async def test_plugin_sync_lifecycle_subclass():
 
 
 def test_plugin_empty_dependencies_independent():
-    """dependencies 为空列表时默认可独立加载。"""
+    """dependencies 为空时默认可独立加载。"""
     plugin = MinimalPlugin()
-    assert plugin.dependencies == []
+    assert plugin.dependencies == ()
     assert isinstance(plugin, Plugin)
+
+
+def test_dependencies_default_is_immutable_and_unshared():
+    """默认 dependencies 是不可变元组：没有"所有子类共享一个列表"的坑。"""
+    assert Plugin.dependencies == ()
+    assert isinstance(Plugin.dependencies, tuple)
+
+    # 旧实现（list 默认值）下这里会污染所有插件的类属性
+    with pytest.raises(AttributeError):
+        Plugin.dependencies.append("x")  # type: ignore[attr-defined]
+
+    class Sibling(Plugin):
+        name = "sibling"
+
+        async def load(self, ctx: Context) -> None:
+            ...
+
+    assert Sibling.dependencies == ()
+    assert Plugin.dependencies == ()
+

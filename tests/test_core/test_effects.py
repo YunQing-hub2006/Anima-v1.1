@@ -261,3 +261,26 @@ def test_push_task_rejects_non_task():
     tracker = EffectTracker()
     with pytest.raises(TypeError):
         tracker.push_task("not-a-task")  # type: ignore[arg-type]
+
+
+async def test_push_task_already_cancelled_keeps_rolling_back():
+    """已取消的任务不得阻断回滚栈（CancelledError 不可逃出 rollback）。"""
+    tracker = EffectTracker()
+    executed: list[str] = []
+
+    async def long_running():
+        await asyncio.sleep(60)
+
+    task = asyncio.ensure_future(long_running())
+    await asyncio.sleep(0)
+    task.cancel()
+    while not task.done():
+        await asyncio.sleep(0)
+    assert task.cancelled()
+
+    tracker.push(lambda: executed.append("survivor"))
+    tracker.push_task(task)
+
+    await tracker.rollback()  # 修复前：CancelledError 逃出，survivor 永不执行
+    assert executed == ["survivor"]
+    assert tracker.count() == 0

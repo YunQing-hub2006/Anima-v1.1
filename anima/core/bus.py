@@ -11,7 +11,8 @@
 两组各自内部按注册顺序执行；同步 handler 立即执行，协程 handler 的
 执行时机由事件循环调度决定，与注册顺序无关。
 
-单个 handler 抛异常不影响其他 handler 的执行。
+单个 handler 抛异常不影响其他 handler 的执行：异常被隔离、交由
+``on_error`` 钩子上报（默认写 ``anima.bus`` logger），不上抛给发布方。
 
 线程语义（v1.1 明确）:
 
@@ -30,9 +31,19 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable
 
+from anima.core.log import logger
+
 Handler = Callable[[Any], Any]
 
-__all__ = ["EventBus"]
+#: handler 异常上报钩子，签名 ``(event, handler, exc) -> None``。
+#:
+#: 上报**不改变异常隔离语义**：异常依旧不会抛给 ``emit`` 的调用方，
+#: 只是不再无声无息。
+ErrorHook = Callable[[str, Handler, BaseException], None]
+
+_log = logger.getChild("bus")
+
+__all__ = ["ErrorHook", "EventBus"]
 
 
 def _wildcard_prefix(pattern: str) -> str:
@@ -45,11 +56,34 @@ class EventBus:
 
     精确事件走 ``dict`` 索引实现 O(1) 查找；通配订阅维护在独立的
     ``(前缀, handler)`` 列表中，emit 时线性扫描。
+
+    单个 handler 抛出的异常被**隔离**（不上抛给发布方）并交给
+    ``on_error`` 上报；未提供钩子时默认写 ``anima.bus`` logger。
+    因此"订阅写错了"不会再完全无声。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_error: ErrorHook | None = None) -> None:
         self._exact: dict[str, list[Handler]] = {}
         self._wild: list[tuple[str, Handler]] = []
+        self._on_error = on_error
+
+    def set_error_hook(self, hook: ErrorHook | None) -> None:
+        """替换（或清除）handler 异常上报钩子；``None`` 恢复默认 logger 上报。"""
+        self._on_error = hook
+
+    def _report(self, event: str, handler: Handler, exc: BaseException) -> None:
+        """上报被隔离的 handler 异常。
+
+        上报本身也必须遵守异常隔离不变式：钩子自己抛异常时退回默认
+        logger，绝不让异常从 ``emit`` 漏给发布方。
+        """
+        try:
+            if self._on_error is not None:
+                self._on_error(event, handler, exc)
+            else:
+                _log.error("事件 handler 抛异常: event=%r handler=%r", event, handler, exc_info=exc)
+        except Exception:
+            _log.exception("异常上报钩子自身失败: event=%r", event)
 
     # -- 订阅管理 ---------------------------------------------------------
 
@@ -93,12 +127,14 @@ class EventBus:
         """同步发布事件。
 
         同步 handler 立即执行；协程 handler 调度到事件循环（无运行中的
-        事件循环时静默丢弃并保持异常隔离）。单个 handler 的异常被吞掉。
+        事件循环时静默丢弃并保持异常隔离）。单个 handler 的异常被隔离
+        并经 ``_report`` 上报，不影响其他 handler。
         """
         for handler in self._handlers(event):
             try:
                 result = handler(data)
-            except Exception:
+            except Exception as exc:
+                self._report(event, handler, exc)
                 continue
             if asyncio.iscoroutine(result):
                 _schedule_coroutine(result)
@@ -107,13 +143,15 @@ class EventBus:
         """异步发布事件。
 
         协程 handler 各自包装为 Task 立即返回；同步 handler 同步执行。
-        返回创建的 Task 列表（无协程 handler 时为空列表）。
+        返回创建的 Task 列表（无协程 handler 时为空列表）。同步 handler
+        的异常同 :meth:`emit`：隔离并上报，不上抛。
         """
         tasks: list[asyncio.Task[None]] = []
         for handler in self._handlers(event):
             try:
                 result = handler(data)
-            except Exception:
+            except Exception as exc:
+                self._report(event, handler, exc)
                 continue
             if asyncio.iscoroutine(result):
                 tasks.append(asyncio.ensure_future(result))
