@@ -417,3 +417,95 @@ async def test_emit_and_wait_without_coroutine_handlers():
     bus.subscribe("evt", lambda d: seen.append(d))
     await bus.emit_and_wait("evt", 1)
     assert seen == [1]
+
+# ---------- v1.3: 事件优先级（P3-1）与 emit_collect（P3-2） ----------
+
+
+def test_priority_orders_handlers():
+    """priority 大的先执行；同优先级仍按注册顺序（稳定排序）。"""
+    bus = EventBus()
+    calls: list[str] = []
+    bus.subscribe("evt", lambda d: calls.append("low"), priority=-5)
+    bus.subscribe("evt", lambda d: calls.append("zero-1"))
+    bus.subscribe("evt", lambda d: calls.append("high-1"), priority=10)
+    bus.subscribe("evt", lambda d: calls.append("zero-2"))
+    bus.subscribe("evt", lambda d: calls.append("high-2"), priority=10)
+
+    bus.emit("evt", None)
+    assert calls == ["high-1", "high-2", "zero-1", "zero-2", "low"]
+
+
+def test_priority_keeps_exact_before_wildcard():
+    """顺序契约不变：精确组仍整体先于通配组，优先级只在组内生效。"""
+    bus = EventBus()
+    calls: list[str] = []
+    bus.subscribe("evt.*", lambda d: calls.append("wild-high"), priority=100)
+    bus.subscribe("evt.click", lambda d: calls.append("exact-low"), priority=-100)
+
+    bus.emit("evt.click", None)
+    assert calls == ["exact-low", "wild-high"]
+
+
+def test_zero_priority_keeps_registration_order():
+    """全零优先级时走不排序的热路径，行为与 v1.2 完全一致。"""
+    bus = EventBus()
+    calls: list[str] = []
+    bus.subscribe("evt", lambda d: calls.append("a"))
+    bus.subscribe("evt", lambda d: calls.append("b"))
+
+    bus.emit("evt", None)
+    assert calls == ["a", "b"]
+    assert bus._prioritized is False
+
+
+def test_priority_subscription_can_be_unsubscribed():
+    """带优先级的订阅照样能取消（精确与通配都要）。"""
+    bus = EventBus()
+    calls: list[str] = []
+    handler = lambda d: calls.append("x")  # noqa: E731
+    bus.subscribe("evt", handler, priority=3)
+    bus.subscribe("evt.*", handler, priority=3)
+
+    bus.unsubscribe("evt", handler)
+    bus.unsubscribe("evt.*", handler)
+    bus.emit("evt", None)
+    assert calls == []
+    assert bus.count() == 0
+
+
+async def test_emit_collect_gathers_sync_and_async_results():
+    """emit_collect 收集同步返回值与协程结果，顺序即执行顺序。"""
+    bus = EventBus()
+    bus.subscribe("query", lambda d: "sync:" + str(d))
+    bus.subscribe("query", lambda d: None, priority=-1)
+
+    async def slow(d):
+        await asyncio.sleep(0)
+        return "async:" + str(d)
+
+    bus.subscribe("query", slow, priority=5)
+    assert await bus.emit_collect("query", 1) == ["async:1", "sync:1", None]
+
+
+async def test_emit_collect_isolates_exceptions():
+    """抛异常的 handler 不产出结果，也不打断其余 handler，异常照旧上报。"""
+    seen: list = []
+    bus = EventBus(on_error=lambda ev, h, exc: seen.append(exc))
+
+    def boom(_):
+        raise RuntimeError("同步炸")
+
+    async def async_boom(_):
+        raise ValueError("异步炸")
+
+    bus.subscribe("q", boom)
+    bus.subscribe("q", async_boom)
+    bus.subscribe("q", lambda d: "ok")
+
+    assert await bus.emit_collect("q", None) == ["ok"]
+    assert len(seen) == 2
+
+
+async def test_emit_collect_without_handlers():
+    """无人订阅时收集到空列表。"""
+    assert await EventBus().emit_collect("nobody", 1) == []

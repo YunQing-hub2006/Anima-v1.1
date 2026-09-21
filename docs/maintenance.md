@@ -27,7 +27,7 @@ python -m venv .venv
 ## 2. 仓库地图
 
 ```
-anima/core/            内核（1104 物理行 / 553 代码行，纯标准库，接口已冻结）
+anima/core/            内核（1196 物理行 / 617 代码行，纯标准库，接口已冻结）
   app.py               组装器：start/stop、effects 持有者
   bus.py               事件总线：_exact dict + _wild 列表 + 异常上报钩子
   registry.py          服务注册表
@@ -36,13 +36,14 @@ anima/core/            内核（1104 物理行 / 553 代码行，纯标准库，
   effects.py           LIFO 副作用栈
   plugin.py            插件 ABC
   exceptions.py        异常体系
+anima/plugins/         插件层（非内核）：discovery entry-point 自动发现（v1.3）
   log.py               日志出口（anima logger，v1.1.2）
-tests/test_core/       173 个测试，14 个文件，按被测模块命名
+tests/                 199 个测试：test_core/ 按被测模块命名 + test_plugins/
   conftest.py          bus/registry/effects/app fixtures + RecorderPlugin
   test_performance.py  性能基准（阈值 = 目标值 x5 安全系数）
   test_edge_cases.py   边界 + 压力
 docs/                  architecture / core_api / maintenance 三份文档
-examples/              可运行示例（hello / dependency / rollback / hot_reload）
+examples/              可运行示例（hello / dependency / rollback / hot_reload / priorities）
 check_kernel_rules.py  铁律检查（raw<1200 + code<650、无第三方 import）
 pyproject.toml         pytest/coverage 配置
 ```
@@ -61,6 +62,8 @@ pyproject.toml         pytest/coverage 配置
    物理行防文件膨胀，**代码行才是“内核保持小巧”的守门指标**——本内核
    docstring 占比约五成，只看物理行会在文档变详细后失真。
    加功能前先想能不能放到 `anima/plugins/` 或 `anima/utils/`（默认答案
+   **v1.3.0 余量：物理行 4 行、代码行 33 行**——下次往内核加东西之前，先解决
+   规模问题（精简文档 / 非功能点外移到 `anima/plugins/` / 正式上调上限）。
    通常是“能”）；新增公共能力前先估代码行数。
 
 ## 4. 开发流程（测试先行）
@@ -87,7 +90,8 @@ pyproject.toml         pytest/coverage 配置
   `"*"` 匹配一切。改匹配规则属破坏性变更。
 - **顺序契约（v1.1.1 锁定）**：精确 handler 先于通配 handler，组内按
   注册顺序——由 `test_handler_order_contract` 锁死。若引入真正的优先级
-  排序，必须先过该测试再显式设计；`_wild_matches` 内不再有任何排序。
+  排序，必须先过该测试再显式设计。v1.3 正是按这个流程引入显式 priority：
+排序只发生在用过非零 priority 时，`_wild_matches` 已并入 `_handlers`。
 - 新增订阅结构时同步维护 `count()`/`clear()`，`App.stop` 的"bus 为空"
   验收依赖 `count()` 正确。
 - emit 的异常隔离必须保持：改 handler 调度时先读 `test_handler_exception_isolation`。
@@ -107,6 +111,13 @@ pyproject.toml         pytest/coverage 配置
   时另一线程仍能订阅）、`test_handler_can_subscribe_reentrantly`、
   `test_concurrent_subscribe_unsubscribe_stress`。
 - `emit_and_wait`（v1.2）只是 `emit_async` 加 `gather(return_exceptions=True)`
+- **v1.3 优先级**：`subscribe(..., priority=)` 只在“用过非零 priority”时排序
+  （`_prioritized`），全零走原路径。锁死用例 `test_zero_priority_keeps_registration_order`
+  （断言 `_prioritized is False`）与 `test_handler_order_contract`（顺序契约不变）。
+  注意 `_exact` / `_wild` 现在存的是元组（priority, seq, handler）：`unsubscribe` 按
+  handler 匹配、`count` 计数语义不变，改结构时这两条要一起看。
+- **v1.3 `emit_collect`**：异常隔离与 `emit` 一致，区别只是把返回值收集起来；
+  改它先过 `test_emit_collect_isolates_exceptions`（抛异常者不产出结果、也不打断别人）。
   的便捷封装；不要把它改成“等同步 handler”，同步 handler 一直就是立即执行。
 
 ### plugin.py
@@ -160,6 +171,9 @@ pyproject.toml         pytest/coverage 配置
   `test_load_one_rejects_dependency_not_loaded`。
 - **v1.2 `dependents_of`** 是纯查询，供 `App.unload_plugin` 拒绝“卸载还有人
   依赖的插件”。不要把这条守卫下沉进 `LifecycleManager.unload`——批量卸载走
+- **v1.3 生命周期事件**：`load_all` / `load_one` / `enable` / `unload` 各发一次
+  `kernel.plugin.*`。`unloaded` 必须在 `effects.rollback()` **之后**发出，否则卸载者
+  会收到自己的讣告——锁死用例 `test_plugin_cannot_hear_its_own_unloaded_event`。
   逆拓扑序，依赖方天然先卸，加进去只会改变冻结方法的错误语义。
 - 卸载错误语义：异常聚合抛出但状态推进到 unloaded；`unload_all` 中
   单插件失败不中断其余（`test_unload_all_continues_after_cleanup_failure`
@@ -175,11 +189,19 @@ pyproject.toml         pytest/coverage 配置
 - **v1.2 ctx 注入**：`load_all` / `load_one` 都在调用 `plugin.load()` 之前写
   `plugin.ctx = ctx`。`Plugin.ctx` 只在 `if TYPE_CHECKING` 块内声明——运行时
   没有这个类属性，因此**不要在契约层运行时 import Context**（会倒置架构 §2 的
+- `config_defaults` 是**只读映射**：声明式类属性不该被子类就地写脏（同
+  `dependencies` 的理由）。不要把它改成普通 dict。
   依赖方向）。锁死用例：`test_plugin_ctx_injected_for_all_phases`、
   `test_plugin_ctx_refreshed_after_restart`。
 - **v1.2 热插拔**：`App.load_plugin` / `unload_plugin` 都要求 App 已 start；
   `unload_plugin` 在有依赖方时抛 `LifecycleError`（不做级联卸载）。锁死用例：
   `test_app_hot_plug_requires_started_app`、
+- **v1.3 `config_defaults`**：Context 构造时用 `type(plugin).config_defaults` 填**缺失**
+  的 key（显式配置优先），因此只认类级声明、不认实例属性。默认值是不可写的
+  `MappingProxyType`，由 `test_config_defaults_is_read_only_mapping` 锁死。
+- **v1.3 interface 校验**：`provide` 在注册点抛 `TypeError`（且不留半注册）；
+  `use` / `use_strict` 在取用点抛 `ServiceNotFoundError`。**别把后者改成 TypeError**：
+“以该契约取不到服务”要和“未注册”走同一条 default 回退路径。
   `test_app_unload_plugin_refuses_when_depended_on`。
 - `config` 切片是引用共享（对 app.config 的修改插件可见）--这是特性不是 bug，
   不要改成拷贝。

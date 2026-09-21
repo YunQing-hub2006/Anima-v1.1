@@ -1,4 +1,4 @@
-# Anima 内核架构设计（v1.2.0）
+# Anima 内核架构设计（v1.3.0）
 
 > 本文是内核的正式架构设计文档，配合 [core_api.md](core_api.md)（接口签名）
 > 与 [maintenance.md](maintenance.md)（开发维护指南）使用。
@@ -7,6 +7,8 @@
 > 文档化，详见 core_api.md 变更记录。v1.1.2 为正确性修复 + 异常上报与
 > 日志出口，同属非破坏性变更。
 > v1.2 为总线健壮性（加锁）与易用性（ctx 注入 / use_strict / 热插拔），
+> v1.3 为编排能力（优先级 / 请求-响应 / 生命周期事件 / 配置默认值 / 接口校验）
+> 与非内核的插件自动发现，仍是纯新增。
 > 同样只新增接口。
 
 ---
@@ -16,7 +18,7 @@
 | 维度 | 目标 | 达成情况 |
 |---|---|---|
 | 依赖 | 零外部依赖，`core/` 只 import 标准库 | ✅ 由 `check_kernel_rules.py` 自动检查 |
-| 规模 | `core/` raw < 1200 / code < 650 | ✅ 1104 物理行 / **553 代码行** |
+| 规模 | `core/` raw < 1200 / code < 650 | ✅ 1196 物理行 / **617 代码行** |
 | 类型 | 所有公共接口类型注解完整 | ✅ |
 | 测试 | 每模块行覆盖率 >= 90% | ✅ 总体 99%，最低模块 98% |
 | 性能 | 见第 8 节基准表 | ✅ 全部达标 |
@@ -112,6 +114,8 @@ AnimaError
   统一回滚副作用（v1.1.2 修正：此前本文与 `plugin.py` 误称 disable 也
   回滚，与 `LifecycleManager.disable()` 的实现不符）。
 - `dependencies` 默认值是**不可变元组** `()`（v1.1.2 起）：声明式元数据
+- `config_defaults`（v1.3）同样是声明式元数据，默认值还是**只读映射**；框架在
+  `load()` 前把缺失的 key 填进 `ctx.config`。
   不应让子类共享同一个可变 list。
 - 同步/异步统一：三个阶段方法允许子类写成 `def`，内核 `LifecycleManager._call`
   用 `inspect.isawaitable` 分派。
@@ -150,6 +154,11 @@ _wild:  list[tuple[prefix, Handler]]    # 通配订阅，emit 时线性扫描
 **`emit_and_wait`（v1.2）**：`emit_async` 的配套便捷方法——
 `emit_async` 把协程 handler 包成 Task 返回，调用方一旦忘记 await，任务就可能
 在 GC 时被静默丢弃；`emit_and_wait` 内部 `gather(return_exceptions=True)`，
+
+**优先级与请求-响应（v1.3）**：`subscribe(..., priority=n)` 让 n 大的先执行，
+同优先级仍按注册顺序（稳定排序），“精确组整体先于通配组”不变；只有用过
+非零 priority 才排序。`emit_collect()` 收集全部 handler 的返回值（同步直接、
+协程 await），异常仍按 handler 隔离。
 是“发布并等它跑完”这个常见用法的正确默认。
 
 ### 4.4 registry.py — 服务注册表
@@ -181,6 +190,9 @@ LIFO 栈 + 逐项回滚：
   三个阶段方法都能直接用 `self.ctx`，插件不必自己保存 load 的参数；
   重启（stop 后再 start）会注入新的 Context。
 - **v1.2 `use_strict()`**：取不到服务就抛，把“忘 provide / 拼错名字”
+- **v1.3**：`config_defaults` 填配置默认值；`provide` / `use` / `use_strict` 支持
+  `interface` 校验；新增 `emit_and_wait` / `emit_collect`——Context 是插件唯一窗口，
+  总线上的发布方法在这里都有对应入口。
   从“使用时才炸”提前到“取用点就炸”。
 
 ### 4.7 lifecycle.py — 生命周期管理器（内核最复杂的模块）
@@ -203,6 +215,8 @@ unloaded ──load──> loaded ──enable──> enabled
    └────────unload（enabled 下先自动 disable）┘
 ```
 
+- **生命周期事件（v1.3）**：每次成功转换后发 `kernel.plugin.loaded` / `enabled` /
+  `unloaded`（payload 为插件名）；`unloaded` 在副作用回滚之后，卸载者自己收不到。
 - 合法转换之外的任何操作抛 `LifecycleError`；未知插件名同样抛错
   （`get_state` 例外：未知按 `unloaded` 返回）。
 - `enable_all` 按加载顺序启用（依赖先于依赖方启用）；
@@ -448,6 +462,15 @@ v1.2 给订阅表加锁后实测 emit 平均 **0.78 µs**，仍远低于 <100 µ
 17. **v1.2 热插拔的失败半径与卸载守卫**：`load_one` 失败**只回滚自己**——绝不能
     复用它家的 `_raise_with_rollback_errors`，那会把整台 App 卸掉；
     `unload_plugin` 在有依赖方时**拒绝执行**而非级联卸载——级联会静默卸掉
+18. **v1.3 优先级做成“零成本默认”**：事件顺序是有契约的（精确先于通配、
+    组内注册序），加优先级不能动它。于是把 priority 默认 0、只在真的用过非零值
+    时才排序（`_prioritized`）——老代码的路径一行没变，两条契约测试也都不用改。
+19. **v1.3 生命周期事件在副作用回滚之后发**：`unloaded` 若发在回滚之前，卸载中的
+    插件会收到自己的讣告，而它的状态位此时已经不确定。放到回滚之后，语义干净：
+    收到事件的人一定还活着。
+20. **v1.3 自动发现不进内核**：entry points 属于“怎么装载插件”，不是
+    “插件怎么活/怎么死/怎么通信”；而且内核物理行只剩个位数余量。放
+    `anima/plugins/` 里，`check_kernel_rules.py` 只管 `core/`，两边都干净。
     用户没点名的插件，比直接报错更难排查。
 
 ---
@@ -459,9 +482,10 @@ v1.2 给订阅表加锁后实测 emit 平均 **0.78 µs**，仍远低于 <100 µ
 | 线程安全总线 | ✅ 订阅表已加锁（v1.2）；剩余的 `emit_threadsafe()`（协程 handler 的跨线程调度网关）未做 | bus.py |
 | 严格服务获取 | ✅ v1.2 已实施：`use_strict()` 抛 `ServiceNotFoundError`，`use()` 语义冻结 | registry.py |
 | 单插件热插拔 | ✅ v1.2 已实施：`App.load_plugin` / `unload_plugin`（替换式重载仍需新实例） | app.py |
-| 类型形式 provide/use | `ctx.provide(ConfigService, ...)`（v1.1 登记为框架层封装，不进内核） | plugins 层 |
+| 插件自动发现 | ✅ v1.3 已实施：`anima/plugins/discovery.py`（entry points，非内核） | plugins/ |
+| 类型形式 provide/use | ✅ v1.3 部分实施：`provide/use(interface=T)` 做运行时校验；类键形式 | plugins 层 |
 | 插件热重载 | 文件监听属 `anima/plugins/hotreload.py`，内核不需改动 | plugins/ |
-| 事件优先级/延迟 | handler 包装排序（v1.1.1 已移除 `_wild_matches` 内的不可观察排序钩子；真实优先级需显式设计执行顺序） | bus.py |
+| 事件优先级/延迟 | ✅ v1.3 已实施显式 `priority`（零成本默认）；延迟（defer）仍未做 | bus.py |
 | 条件启用 | config 切片加 `enabled: false` 约定 | lifecycle.py |
 
 > **规模口径（v1.2 起）**：`check_kernel_rules.py` 强制两条——`raw < 1200` 物理
@@ -469,6 +493,6 @@ v1.2 给订阅表加锁后实测 emit 平均 **0.78 µs**，仍远低于 <100 µ
 > `raw < 1000` 在 docstring 变详细后开始失真：1.1.2 结束时 961 物理行其实只有
 > 约 500 行代码，而迭代 2 的新增直接把它顶到 1104。拆分后物理行防文件膨胀，
 > **代码行才是“内核保持小巧”的守门指标**。当前 1104 / 553，余量约 96 物理行、
-> 97 代码行。
+> 33 代码行（v1.3.0 后：物理行仅剩 4 行）。
 
 任何演进若改动冻结接口，必须走第 6 节（维护指南）的变更评审流程。

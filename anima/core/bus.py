@@ -11,6 +11,9 @@
 两组各自内部按注册顺序执行；同步 handler 立即执行，协程 handler 的
 执行时机由事件循环调度决定，与注册顺序无关。
 
+优先级（v1.3 新增）: ``subscribe(..., priority=n)`` 让 n 大的先执行，同优先级仍
+按注册顺序；只在真的用过非零 priority 时排序，"精确组先于通配组"不变。
+
 单个 handler 抛异常不影响其他 handler 的执行：异常被隔离、交由
 ``on_error`` 钩子上报（默认写 ``anima.bus`` logger），不上抛给发布方。
 
@@ -75,8 +78,10 @@ class EventBus:
     def __init__(self, on_error: ErrorHook | None = None) -> None:
         # RLock：允许同线程重入，避免将来有人在锁内回调 handler 时死锁。
         self._lock = threading.RLock()
-        self._exact: dict[str, list[Handler]] = {}
-        self._wild: list[tuple[str, Handler]] = []
+        self._seq = 0
+        self._prioritized = False
+        self._exact: dict[str, list[tuple[int, int, Handler]]] = {}
+        self._wild: list[tuple[str, int, int, Handler]] = []
         self._on_error = on_error
 
     def set_error_hook(self, hook: ErrorHook | None) -> None:
@@ -99,34 +104,37 @@ class EventBus:
 
     # -- 订阅管理 ---------------------------------------------------------
 
-    def subscribe(self, event: str, handler: Handler) -> None:
+    def subscribe(self, event: str, handler: Handler, *, priority: int = 0) -> None:
         """订阅事件。``event`` 为 ``"*"`` 或 ``"前缀.*"`` 时按通配处理。
 
-        任意线程可调用（订阅表由锁保护）。
+        任意线程可调用；``priority`` 越大越先执行（v1.3），默认 0 即注册顺序。
         """
         with self._lock:
+            self._seq += 1
+            if priority != 0:
+                self._prioritized = True
             if event == "*":
-                self._wild.append(("", handler))
+                self._wild.append(("", priority, self._seq, handler))
                 return
             if event.endswith(".*") and len(event) >= 2:
-                self._wild.append((_wildcard_prefix(event), handler))
+                self._wild.append((_wildcard_prefix(event), priority, self._seq, handler))
                 return
-            self._exact.setdefault(event, []).append(handler)
+            self._exact.setdefault(event, []).append((priority, self._seq, handler))
 
     def unsubscribe(self, event: str, handler: Handler) -> None:
         """取消订阅；订阅不存在时静默成功（幂等）。任意线程可调用。"""
         with self._lock:
             if event == "*" or (event.endswith(".*") and len(event) >= 2):
                 prefix = "" if event == "*" else _wildcard_prefix(event)
-                self._wild = [(p, h) for p, h in self._wild if not (p == prefix and h == handler)]
+                self._wild = [w for w in self._wild if not (w[0] == prefix and w[3] == handler)]
                 return
             handlers = self._exact.get(event)
             if handlers is None:
                 return
-            try:
-                handlers.remove(handler)
-            except ValueError:
-                pass
+            for index, entry in enumerate(handlers):
+                if entry[2] == handler:
+                    del handlers[index]
+                    break
             if not handlers:
                 del self._exact[event]
 
@@ -136,10 +144,6 @@ class EventBus:
             return sum(len(v) for v in self._exact.values()) + len(self._wild)
 
     # -- 发布 ---------------------------------------------------------
-
-    def _wild_matches(self, event: str) -> list[Handler]:
-        matched = [h for prefix, h in self._wild if event.startswith(prefix)]
-        return matched
 
     def emit(self, event: str, data: Any = None) -> None:
         """同步发布事件。
@@ -188,10 +192,40 @@ class EventBus:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def emit_collect(self, event: str, data: Any = None) -> list[Any]:
+        """发布事件并收集**全部** handler 的返回值（请求-响应，v1.3）。
+
+        同步返回值直接收集、协程结果 await 后收集，顺序即执行顺序。单个
+        handler 的异常仍被隔离并上报：不产出结果，也不打断其余 handler。
+        """
+        results: list[Any] = []
+        for handler in self._handlers(event):
+            try:
+                result = handler(data)
+            except Exception as exc:
+                self._report(event, handler, exc)
+                continue
+            if asyncio.iscoroutine(result):
+                try:
+                    results.append(await result)
+                except Exception as exc:
+                    self._report(event, handler, exc)
+            else:
+                results.append(result)
+        return results
+
     def _handlers(self, event: str) -> list[Handler]:
-        """锁内拷出本次发布要调用的 handler 列表——锁不跨越 handler 执行。"""
+        """锁内拷出本次发布要调用的 handler 列表——锁不跨越 handler 执行。
+
+        只在用过非零 priority 时排序，全零时按注册顺序直接返回。
+        """
         with self._lock:
-            return [*self._exact.get(event, []), *self._wild_matches(event)]
+            exact = list(self._exact.get(event, []))
+            wild = [w for w in self._wild if event.startswith(w[0])]
+            if self._prioritized:
+                exact.sort(key=lambda e: (-e[0], e[1]))
+                wild.sort(key=lambda w: (-w[1], w[2]))
+            return [e[2] for e in exact] + [w[3] for w in wild]
 
     def clear(self) -> None:
         """移除全部订阅（框架 stop 时调用）。"""

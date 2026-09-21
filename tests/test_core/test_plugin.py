@@ -161,3 +161,22 @@ async def test_plugin_ctx_refreshed_after_restart():
     await app.start([plugin])
     assert plugin.ctx is not first
     await app.stop()
+
+# ---------- v1.3: config_defaults 声明（P2-4） ----------
+
+
+def test_config_defaults_is_read_only_mapping():
+    """默认 config_defaults 是只读映射：子类就地写会直接报错，不会污染全局。"""
+    assert dict(Plugin.config_defaults) == {}
+    with pytest.raises(TypeError):
+        Plugin.config_defaults["x"] = 1  # type: ignore[index]
+
+    class WithDefaults(Plugin):
+        name = "with-defaults-plugin"
+        config_defaults = {"a": 1}
+
+        async def load(self, ctx: Context) -> None:
+            ...
+
+    assert dict(WithDefaults.config_defaults) == {"a": 1}
+    assert dict(Plugin.config_defaults) == {}

@@ -3,6 +3,69 @@
 所有显著变更记录于此文件。版本号遵循语义化版本规范；内核公共接口自
 v1.0 起冻结，任何破坏性变更需走 `maintenance.md` 第 6 节的评审流程。
 
+## [1.3.0] — 2026-09-08
+
+**迭代 3**：编排能力。全部为**新增**接口（次版本号变更），无破坏性改动。
+唯一的行为取舍：加了优先级之后，全零 priority 仍等价于纯注册顺序，由
+`test_handler_order_contract` 与 `test_zero_priority_keeps_registration_order`
+双重锁死。
+
+### 新增
+
+- **事件优先级（P3-1）**：`EventBus.subscribe(..., priority=n)` 与
+  `Context.on(..., priority=n)`，n 大的先执行、同优先级仍按注册顺序
+  （稳定排序）；“精确组整体先于通配组”不变。只有真的用过非零
+  priority 才排序，未使用时热路径零额外开销。
+- **`emit_collect()`（P3-2）**：请求-响应模式，收集全部 handler 的返回值
+  （同步直接收集、协程 await 后收集），异常仍按 handler 隔离。同时补上
+  `Context.emit_and_wait()` 与 `Context.emit_collect()`——否则插件要用这两个
+  方法就得绕过 Context 去碰 bus，而 Context 本应是插件看到的唯一窗口。
+- **生命周期事件（P3-3）**：新增 `EVENT_PLUGIN_LOADED` /
+  `EVENT_PLUGIN_ENABLED` / `EVENT_PLUGIN_UNLOADED`（组名 `kernel.plugin.*`，
+  payload 是插件名），`load_all` / `load_one` / `enable` / `unload` 在各阶段
+  成功后发出。`unloaded` 特意放在副作用回滚**之后**——卸载者自己的订阅
+  那时已经没了，不会收到自己的讣告。
+- **`Plugin.config_defaults`（P2-4）**：声明式配置默认值，框架在 `load()` 前
+  把缺失的 key 填进 `ctx.config`，显式配置优先。默认值是**只读映射**
+  （`MappingProxyType`）——与 v1.1.2 修 `dependencies` 同一个理由：声明式
+  类属性不该被子类就地写脏。
+- **服务接口校验（P3-4）**：`Context.provide(..., interface=T)` 在**注册点**
+  校验（不符抛 `TypeError`，且不留半注册）；`Context.use(..., interface=T)` /
+  `use_strict(..., interface=T)` 在**取用点**校验（不符抛
+  `ServiceNotFoundError`，视作“以该契约取不到服务”，调用方的 default
+  回退照常可用）。
+- **插件自动发现（P4-2）**：新增 `anima/plugins/discovery.py` 的
+  `discover_plugins(group=“anima.plugins”)`，从 importlib.metadata
+  entry points 装载插件（value 可以是 `Plugin` 子类或无参工厂），按 entry
+  point 名排序保证可复现，拿到的不是 Plugin 实例时启动前就抛 `TypeError`。
+  **放在 `anima/plugins/` 而不是内核**：这不属于“插件怎么活/怎么死/”
+  “怎么通信”，而且内核有行数铁律。
+- **示例**：新增 `examples/priorities.py`（优先级 + emit_collect +
+  config_defaults），并纳入 `test_examples.py` 的子进程实跑。
+
+### 文档
+
+- `core_api.md` / `architecture.md` / `maintenance.md` / `README.md` 同步；
+  ADR 新增 18（优先级为何“零成本默认”）、19（生命周期事件为何放在
+  回滚之后）、20（自动发现为何不进内核）。
+
+### 测试
+
+- @test_examples.py@ 的子进程调用显式钉住 UTF-8（@encoding="utf-8"@ + 子进程
+  @PYTHONIOENCODING=utf-8@）：此前 @text=True@ 会按本地编码（GBK）解码子进程
+  输出，只有打印中文的示例受影响，表现为“单跑能过、全量跑偶发失败”。
+
+### 验收
+
+- 规模 1104 -> **1196 物理行 / 617 代码行**（上限 1200 / 650）
+- 测试 173 -> **199 个**（+26）
+- 覆盖率 **99%**（lifecycle 98%，未覆盖 3 行仍是 v1.0 起的历史缺口）
+- `check_kernel_rules.py` 通过：纯标准库、无第三方 import
+
+> ⚠️ **物理行余量只剩 4 行**。这一版没有上调上限，而是把新增 docstring 写紧
+> 换来的空间。下次再往内核加东西之前必须先解决规模问题（精简文档 / 非内核
+> 关注点外移 / 正式上调），否则第一个断言就会挡住提交。
+
 ## [1.2.0] — 2026-09-08
 
 **迭代 2**：总线健壮性与易用性。公共接口全部为**新增**（次版本号变更）。

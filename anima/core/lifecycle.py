@@ -21,10 +21,22 @@ from anima.core.plugin import Plugin
 if TYPE_CHECKING:
     from anima.core.app import App
 
-__all__ = ["LifecycleManager", "PluginState"]
+__all__ = [
+    "EVENT_PLUGIN_ENABLED",
+    "EVENT_PLUGIN_LOADED",
+    "EVENT_PLUGIN_UNLOADED",
+    "LifecycleManager",
+    "PluginState",
+]
 
 #: 合法的状态字符串（也是 ``get_state`` 的返回值类型别名）。
 PluginState = str
+
+#: 生命周期事件名（v1.3）；payload 是插件名，插件可用 ``ctx.on`` 订阅做横向协作。
+EVENT_PLUGIN_LOADED = "kernel.plugin.loaded"
+EVENT_PLUGIN_ENABLED = "kernel.plugin.enabled"
+#: 在副作用回滚之后发出——卸载中的插件自己订阅不到了。
+EVENT_PLUGIN_UNLOADED = "kernel.plugin.unloaded"
 
 _UNLOADED = "unloaded"
 _LOADED = "loaded"
@@ -88,6 +100,7 @@ class LifecycleManager:
                 self._states[plugin.name] = _LOADED
                 self._load_order.append(plugin.name)
                 await _call(plugin.load, ctx)
+                self._app.bus.emit(EVENT_PLUGIN_LOADED, plugin.name)
         except BaseException as exc:
             await self._raise_with_rollback_errors(exc)
 
@@ -169,6 +182,7 @@ class LifecycleManager:
         self._load_order.append(plugin.name)
         try:
             await _call(plugin.load, ctx)
+            self._app.bus.emit(EVENT_PLUGIN_LOADED, plugin.name)
             await self.enable(plugin.name)
         except BaseException as exc:
             # 只回滚这一个插件——_raise_with_rollback_errors 会卸载全部，
@@ -187,6 +201,7 @@ class LifecycleManager:
             raise LifecycleError(f"插件 {name!r} 不能从 {state} 转换到 enabled")
         await _call(plugin.enable)
         self._states[name] = _ENABLED
+        self._app.bus.emit(EVENT_PLUGIN_ENABLED, name)
 
     async def disable(self, name: str) -> None:
         """禁用插件；仅 ``enabled`` 状态合法。"""
@@ -223,6 +238,8 @@ class LifecycleManager:
         self._states[name] = _UNLOADED
         self._load_order.remove(name)
         self._app.discard_effects(name)
+        # 放在副作用回滚之后：卸载者自己的订阅此时已经没了。
+        self._app.bus.emit(EVENT_PLUGIN_UNLOADED, name)
         if errors:
             raise RollbackError(errors)
 

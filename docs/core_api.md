@@ -1,8 +1,8 @@
-# Anima 内核 API 参考（v1.2.0，已冻结）
+# Anima 内核 API 参考（v1.3.0，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
-> v1.2.0 变更摘要见文末"变更记录"。
+> v1.3.0 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -25,6 +25,7 @@ RollbackError.__cause__                     # 指向第一个子异常
 class Plugin(ABC):
     name: str                                    # 唯一标识，非空
     version: str = "1.0.0"
+    config_defaults: ClassVar[Mapping[str, Any]] = MappingProxyType({})   # v1.3
     dependencies: ClassVar[Sequence[str]] = ()   # 依赖插件的 name（v1.1.2）
 
     if TYPE_CHECKING:                            # v1.2：框架在 load() 之前注入
@@ -43,6 +44,10 @@ enable/disable/unload 允许子类写成同步 `def`，内核统一调度。
 `self.ctx`，因此三个阶段方法都能直接用 `self.ctx`，插件不必再自己
 `self._ctx = ctx`。重启（stop 后再 start）会注入新的 Context。该属性在
 `if TYPE_CHECKING:` 块内声明——只在类型检查期存在，运行时不产生类属性，
+
+`config_defaults`（v1.3）：声明本插件需要的配置项及默认值，框架在
+`load()` 前把**缺失**的 key 填进 `ctx.config`（显式配置优先）。默认值是只读
+映射（`MappingProxyType`），子类只能整体覆盖，不能就地写脏。
 以免契约层反向 import 编排层。
 
 `dependencies` 的默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
@@ -64,10 +69,11 @@ ErrorHook = Callable[[str, Handler, BaseException], None]        # v1.1.2
 class EventBus:
     def __init__(self, on_error: ErrorHook | None = None)        # v1.1.2
     def set_error_hook(self, hook: ErrorHook | None) -> None     # v1.1.2
-    def subscribe(self, event: str, handler: Handler) -> None
+    def subscribe(self, event: str, handler: Handler, *, priority: int = 0)  # v1.3
     def unsubscribe(self, event: str, handler: Handler) -> None   # 幂等
     def emit(self, event: str, data: Any = None) -> None          # 异常隔离
     def emit_async(self, event: str, data: Any = None) -> list[asyncio.Task]
+    async def emit_collect(self, event: str, data: Any = None) -> list[Any]   # v1.3
     async def emit_and_wait(self, event: str, data: Any = None) -> None  # v1.2
     def count(self) -> int          # 有效订阅总数
     def clear(self) -> None         # 清空全部订阅
@@ -78,6 +84,14 @@ class EventBus:
 
 执行顺序契约（v1.1.1 明确）：**精确订阅的 handler 先于通配 handler 执行，
 两组各自内部按注册顺序执行**。同步 handler 立即执行；协程 handler 的
+
+优先级（v1.3）：`priority` 大的先执行，同优先级仍按注册顺序；**精确组整体
+先于通配组**的契约不变（优先级只在组内生效）。只有真的用过非零 priority
+才排序，全零时热路径零额外开销。
+
+`emit_collect()`（v1.3）是请求-响应模式：收集全部 handler 的返回值（同步
+直接收集、协程 await 后收集），顺序即执行顺序；单个 handler 的异常仍被
+隔离并上报，只是不产出结果、也不打断其余 handler。
 执行时机由事件循环调度决定，与注册顺序无关。
 
 异常上报契约（v1.1.2 新增）：handler 抛出的异常依旧**隔离**——不向
@@ -139,11 +153,19 @@ class Context:
     effects: EffectTracker
     config: dict[str, Any]              # app.config["plugins"][plugin.name] 的切片
 
-    def on(self, event: str, handler: Callable) -> Self
+    def on(self, event: str, handler: Callable, *, priority: int = 0) -> Self   # v1.3
+    async def emit_and_wait(self, event: str, data: Any = None) -> None      # v1.3
+    async def emit_collect(self, event: str, data: Any = None) -> list[Any]  # v1.3
     def emit(self, event: str, data: Any = None) -> Self
-    def provide(self, name: str, instance: Any) -> Self
-    def use(self, name: str, default: Any = None) -> Any
-    def use_strict(self, name: str) -> Any                       # v1.2
+    def provide(self, name: str, instance: Any, *, interface: type | None = None) -> Self  # v1.3
+    def use(self, name: str, default: Any = None, *, interface: type | None = None) -> Any  # v1.3
+
+接口校验（v1.3）：`provide(..., interface=T)` 在**注册点**校验，不符抛
+`TypeError` 且不留半注册；`use(..., interface=T)` / `use_strict(..., interface=T)`
+在**取用点**校验，不符抛 `ServiceNotFoundError`——视作“以该契约取不到服务”，
+调用方的 default 回退逻辑照常可用。`Context` 是插件看到内核的唯一窗口：
+总线上的 `emit_and_wait` / `emit_collect` 在 Context 上都有对应方法（v1.3）。
+    def use_strict(self, name: str, *, interface: type | None = None) -> Any                # v1.2
     def on_cleanup(self, callback: CleanupFn) -> Self
     def task(self, coro: Coroutine) -> asyncio.Task              # v1.1
 ```
@@ -156,6 +178,10 @@ class Context:
 ## 生命周期 — `lifecycle.py`
 
 ```python
+
+EVENT_PLUGIN_LOADED = "kernel.plugin.loaded"      # v1.3，payload 是插件名
+EVENT_PLUGIN_ENABLED = "kernel.plugin.enabled"
+EVENT_PLUGIN_UNLOADED = "kernel.plugin.unloaded"  # 在副作用回滚之后发出
 PluginState = str   # "unloaded" | "loaded" | "enabled" | "disabled"
 
 class LifecycleManager:
@@ -171,6 +197,11 @@ class LifecycleManager:
     def dependents_of(self, name: str) -> list[str]             # v1.2 直接依赖方
 ```
 
+
+生命周期事件（v1.3）：`load_all` / `load_one` 每个插件 `load()` 成功后发
+`kernel.plugin.loaded`，`enable` 成功后发 `kernel.plugin.enabled`，`unload` 完成后
+发 `kernel.plugin.unloaded`（**在副作用回滚之后**，所以卸载者自己收不到）。
+payload 是插件名；插件用 `ctx.on("kernel.plugin.*", ...)` 即可横向协作。
 状态机：`unloaded -> loaded -> enabled -> disabled -> unloaded`；
 `enabled` 下 unload 先自动 disable。非法转换抛 `LifecycleError`。
 
@@ -230,9 +261,22 @@ logging.getLogger("anima").setLevel(logging.DEBUG)
 
 ## 公共导出 — `anima.core.__init__`
 
-`AnimaError, App, CleanupFn, Context, DependencyError, EffectTracker,
+`AnimaError, App, CleanupFn, Context, DependencyError, EVENT_PLUGIN_ENABLED,
+EVENT_PLUGIN_LOADED, EVENT_PLUGIN_UNLOADED, EffectTracker,
 ErrorHook, EventBus, LifecycleError, LifecycleManager, Plugin, PluginState,
 RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
+
+## 插件自动发现 — `anima/plugins/discovery.py`（**非内核**，v1.3）
+
+签名：`discover_plugins(group="anima.plugins", *, entry_points=None) -> list[Plugin]`。
+
+从 importlib.metadata entry points 装载插件：value 可以是 `Plugin` 子类或无参
+工厂函数，按 entry point 名排序保证结果可复现，拿到的不是 Plugin 实例时抛
+`TypeError`。第三方包只需声明 `[project.entry-points."anima.plugins"]`。
+
+它**不在 `anima.core` 里**：这不属于“插件怎么活/怎么死/怎么通信”，
+而且内核有行数铁律（maintenance.md 第 8 条）。用法：
+`await app.start(discover_plugins())`。
 
 ## 性能基准（实测，Windows / Python 3.13）
 
@@ -246,6 +290,19 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 | 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.6 KiB |
 
 ## 变更记录
+
+### v1.3.0（2026-09-08）
+
+编排能力，全部为**新增**接口：
+
+- `subscribe(..., priority=)` / `Context.on(..., priority=)`；全零时等价于
+  纯注册顺序（原有顺序契约不变）。
+- `emit_collect()`（总线与 Context）；`Context.emit_and_wait()` 补齐。
+- `EVENT_PLUGIN_LOADED` / `EVENT_PLUGIN_ENABLED` / `EVENT_PLUGIN_UNLOADED`。
+- `Plugin.config_defaults`（只读映射，缺失才填）。
+- `provide` / `use` / `use_strict` 的 `interface` 校验。
+- 非内核的 `anima.plugins.discover_plugins()`（entry points 自动发现）。
+- 规模 1104 -> 1196 物理行 / 617 代码行；测试 173 -> 199 个。
 
 ### v1.2.0（2026-09-08）
 

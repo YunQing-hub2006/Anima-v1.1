@@ -10,7 +10,12 @@ import pytest
 from anima.core.app import App
 from anima.core.context import Context
 from anima.core.exceptions import DependencyError, LifecycleError, RollbackError
-from anima.core.lifecycle import LifecycleManager
+from anima.core.lifecycle import (
+    EVENT_PLUGIN_ENABLED,
+    EVENT_PLUGIN_LOADED,
+    EVENT_PLUGIN_UNLOADED,
+    LifecycleManager,
+)
 from anima.core.plugin import Plugin
 from tests.test_core.conftest import RecorderPlugin, make_plugin
 
@@ -550,3 +555,51 @@ async def test_dependents_of_lists_direct_dependents(app: App):
     await app.lifecycle.load_one(make_plugin("api", dependencies=["db"]))
     assert app.lifecycle.dependents_of("db") == ["api"]
     assert app.lifecycle.dependents_of("api") == []
+
+# ---------- v1.3: 生命周期事件（P3-3） ----------
+
+
+async def test_lifecycle_events_carry_plugin_name(app: App):
+    """loaded / enabled / unloaded 依序发出，payload 是插件名。"""
+    events: list = []
+    for name in (EVENT_PLUGIN_LOADED, EVENT_PLUGIN_ENABLED, EVENT_PLUGIN_UNLOADED):
+        app.bus.subscribe(name, lambda d, n=name: events.append((n, d)))
+
+    await app.start([make_plugin("solo")])
+    assert events == [
+        (EVENT_PLUGIN_LOADED, "solo"),
+        (EVENT_PLUGIN_ENABLED, "solo"),
+    ]
+
+    await app.stop()
+    assert events[-1] == (EVENT_PLUGIN_UNLOADED, "solo")
+
+
+async def test_plugin_cannot_hear_its_own_unloaded_event(app: App):
+    """unloaded 在副作用回滚之后发出：卸载者自己的订阅已经没了。"""
+    received: list = []
+
+    class SelfWatcher(Plugin):
+        name = "self-watcher"
+
+        async def load(self, ctx: Context) -> None:
+            ctx.on(EVENT_PLUGIN_UNLOADED, lambda d: received.append(d))
+
+    await app.start([SelfWatcher()])
+    await app.stop()
+
+    assert received == []
+    assert app.bus.count() == 0
+
+
+async def test_lifecycle_events_cover_hot_plug(app: App):
+    """通配订阅能看到全部生命周期事件，热插拔同样发。"""
+    seen: list = []
+    app.bus.subscribe("kernel.plugin.*", lambda d: seen.append(d))
+
+    await app.start([make_plugin("resident")])
+    await app.load_plugin(make_plugin("late"))
+    await app.unload_plugin("late")
+    await app.stop()
+
+    assert seen == ["resident", "resident", "late", "late", "late", "resident"]

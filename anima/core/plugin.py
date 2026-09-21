@@ -27,8 +27,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, ClassVar
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from anima.core.context import Context
@@ -45,11 +46,14 @@ class Plugin(ABC):
         dependencies: 依赖的其他插件的 ``name``；空表示可独立加载。
             默认值是**不可变元组**，子类不会共享同一个可变对象
             （元组或列表都可赋值；列表在声明式元数据下同样安全）。
+        config_defaults: 配置项及默认值（v1.3）；框架在 ``load()`` 前把缺失的
+            key 填进 ``ctx.config``。只声明，默认值是不可写映射。
     """
 
     name: str = ""
     version: str = "1.0.0"
     dependencies: ClassVar[Sequence[str]] = ()
+    config_defaults: ClassVar[Mapping[str, Any]] = MappingProxyType({})
 
     if TYPE_CHECKING:
         #: 框架在 ``load()`` 前注入（v1.2）。只在类型检查期声明，运行时

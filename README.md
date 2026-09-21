@@ -1,17 +1,22 @@
-# Anima (v1.2.0)
+# Anima (v1.3.0)
 
 Anima 是一个零外部依赖的 Python 插件内核：插件生命周期管理、事件总线、
 服务注册表与副作用自动回滚，全部基于标准库实现。
 
-- **内核规模**: `anima/core/` 共 1104 行，其中**代码 553 行**（上限
-  1200 / 650），仅依赖标准库
-- **测试**: 173 个单元/集成/性能/压力/示例测试，行覆盖率 99%（各模块 ≥98%）
+- **内核规模**: `anima/core/` 共 1196 行，其中**代码 617 行**
+  （上限 1200 / 650），仅依赖标准库
+- **测试**: 199 个单元/集成/性能/压力/示例测试，行覆盖率 99%（各模块 ≥98%）
 - **Python**: >= 3.11
 - **PEP 561**: 自带 `anima/py.typed`，mypy / pyright 可直接读取内联类型
 - **v1.1 新增**: `Context.task()` / `EffectTracker.push_task()` 后台任务
   卸载自动取消；EventBus 线程语义文档化。详见 [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - **v1.1.1 修复**: 批量生命周期原子回滚（load/enable 失败不留半加载状态）、
   `unload_all` 失败聚合不中断、EventBus 顺序契约明确。详见
+  [docs/CHANGELOG.md](docs/CHANGELOG.md)
+- **v1.3 新增**: 事件优先级 `subscribe(..., priority=)`、请求-响应
+  `emit_collect()`、`kernel.plugin.*` 生命周期事件、`config_defaults`
+  配置默认值、`provide/use` 的 `interface` 类型校验，以及非内核的
+  插件自动发现 `anima/plugins/discovery.py`。详见
   [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - **v1.2 新增**: `EventBus` 线程安全（锁不跨越 handler 执行）、
   `emit_and_wait()`、`Plugin.ctx` 自动注入、`use_strict()` 严格获取
@@ -112,7 +117,7 @@ unloaded ──load──> loaded ──enable──> enabled
 ```
 anima/
 ├── __init__.py
-└── core/               # 内核（纯标准库，1104 行 / 代码 553 行）
+└── core/               # 内核（纯标准库，1196 行 / 代码 617 行）
     ├── __init__.py     # 公共 API 导出
     ├── app.py          # App 组装器
     ├── bus.py          # EventBus 事件总线
@@ -124,9 +129,10 @@ anima/
     ├── exceptions.py   # 异常体系
     └── log.py          # 日志出口（anima logger，v1.1.2）
 ├── py.typed            # PEP 561 标记（v1.1.2）
-examples/               # 可运行示例（v1.2）：hello / dependency / rollback / hot_reload
+└── plugins/            # 插件层（非内核）：discovery 自动发现（v1.3）
+examples/               # 可运行示例：hello / dependency / rollback / hot_reload / priorities
 tests/
-└── test_core/          # 173 个测试（覆盖率 99%）
+└── test_core/          # 199 个测试（覆盖率 99%）
 docs/
 ├── CHANGELOG.md        # 变更记录
 ├── core_api.md         # 接口签名

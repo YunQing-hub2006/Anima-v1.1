@@ -60,9 +60,11 @@ class EffectTracker:
         self.push(_cancel_and_await)
         return task
 
-    def on(self, target: "EventBus", event: str, handler: Callable[[Any], Any]) -> None:
-        """订阅事件并自动记录对应的取消订阅。"""
-        target.subscribe(event, handler)
+    def on(
+        self, target: "EventBus", event: str, handler: Callable[[Any], Any], priority: int = 0
+    ) -> None:
+        """订阅事件并自动记录对应的取消订阅。``priority`` 透传给总线（v1.3）。"""
+        target.subscribe(event, handler, priority=priority)
         self.push(lambda: target.unsubscribe(event, handler))
 
     def provide(self, registry: "ServiceRegistry", name: str, instance: Any) -> None:
