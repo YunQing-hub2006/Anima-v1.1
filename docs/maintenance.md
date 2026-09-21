@@ -27,7 +27,7 @@ python -m venv .venv
 ## 2. 仓库地图
 
 ```
-anima/core/            内核（961 行，纯标准库，接口已冻结；上限 1000）
+anima/core/            内核（1104 物理行 / 553 代码行，纯标准库，接口已冻结）
   app.py               组装器：start/stop、effects 持有者
   bus.py               事件总线：_exact dict + _wild 列表 + 异常上报钩子
   registry.py          服务注册表
@@ -37,12 +37,13 @@ anima/core/            内核（961 行，纯标准库，接口已冻结；上�
   plugin.py            插件 ABC
   exceptions.py        异常体系
   log.py               日志出口（anima logger，v1.1.2）
-tests/test_core/       136 个测试，12 个文件，按被测模块命名
+tests/test_core/       173 个测试，14 个文件，按被测模块命名
   conftest.py          bus/registry/effects/app fixtures + RecorderPlugin
   test_performance.py  性能基准（阈值 = 目标值 x5 安全系数）
   test_edge_cases.py   边界 + 压力
 docs/                  architecture / core_api / maintenance 三份文档
-check_kernel_rules.py  铁律检查（行数 <1000、无第三方 import）
+examples/              可运行示例（hello / dependency / rollback / hot_reload）
+check_kernel_rules.py  铁律检查（raw<1200 + code<650、无第三方 import）
 pyproject.toml         pytest/coverage 配置
 ```
 
@@ -55,9 +56,12 @@ pyproject.toml         pytest/coverage 配置
 5. 每模块行覆盖率 >= 90%，新分支必须有对应用例。
 6. 任何 handler / cleanup 抛异常不得影响其他组件（异常隔离不变式）。
 7. `unregister` / `unsubscribe` 幂等（自动回滚路径依赖这一点）。
-8. `core/` 总行数 < 1000（v1.1.2 后**余量只剩 39 行**）。加功能前先想
-   能不能放到 `anima/plugins/` 或 `anima/utils/` -- 默认答案通常是“能”。
-   新增公共能力前**先估行数**，别等铁律检查失败才回头砍。
+8. `core/` 规模满足**两个口径**（v1.2 起，由 `check_kernel_rules.py` 强制）：
+   `raw < 1200` 物理行、`code < 650` 代码行（去掉空行/注释/docstring）。
+   物理行防文件膨胀，**代码行才是“内核保持小巧”的守门指标**——本内核
+   docstring 占比约五成，只看物理行会在文档变详细后失真。
+   加功能前先想能不能放到 `anima/plugins/` 或 `anima/utils/`（默认答案
+   通常是“能”）；新增公共能力前先估代码行数。
 
 ## 4. 开发流程（测试先行）
 
@@ -96,6 +100,14 @@ pyproject.toml         pytest/coverage 配置
   `..._emit_async`（钩子自身崩溃不得外泄）。
 - `EventBus.__init__` 的 `on_error` 与 `set_error_hook` 是 v1.1.2 新增
   的可选能力；默认值 `None` 表示"用默认 logger 上报"，不要改成"静默"。
+- **v1.2 加锁**：订阅表由 `threading.RLock` 保护。唯一不可违反的设计是
+  **锁不跨越 handler 执行**——`_handlers` 必须在锁内拷出列表后立刻释放，
+  否则慢 handler 会阻塞所有线程的订阅、handler 内 subscribe 会死锁。
+  锁死用例：`test_lock_is_not_held_during_handler_execution`（handler 卡住
+  时另一线程仍能订阅）、`test_handler_can_subscribe_reentrantly`、
+  `test_concurrent_subscribe_unsubscribe_stress`。
+- `emit_and_wait`（v1.2）只是 `emit_async` 加 `gather(return_exceptions=True)`
+  的便捷封装；不要把它改成“等同步 handler”，同步 handler 一直就是立即执行。
 
 ### plugin.py
 - `dependencies` 默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
@@ -141,15 +153,34 @@ pyproject.toml         pytest/coverage 配置
   到列举所有剩余节点**——那会把仅被环拖累的下游插件报成环成员，误导
   排查方向。回归 `test_circular_dependency_error_reports_actual_cycle` /
   `test_circular_dependency_three_node_cycle_path`。
+- **v1.2 `load_one`（热插拔）**：依赖只需指向**已加载**插件（不走 `_topo_sort`），
+  且失败回滚**只回滚自己**——绝不能改用 `_raise_with_rollback_errors`，那会
+  把整台 App 卸掉。锁死用例：`test_load_one_failure_rolls_back_only_new_plugin`、
+  `test_load_one_accepts_dependency_already_loaded`、
+  `test_load_one_rejects_dependency_not_loaded`。
+- **v1.2 `dependents_of`** 是纯查询，供 `App.unload_plugin` 拒绝“卸载还有人
+  依赖的插件”。不要把这条守卫下沉进 `LifecycleManager.unload`——批量卸载走
+  逆拓扑序，依赖方天然先卸，加进去只会改变冻结方法的错误语义。
 - 卸载错误语义：异常聚合抛出但状态推进到 unloaded；`unload_all` 中
   单插件失败不中断其余（`test_unload_all_continues_after_cleanup_failure`
   / `test_unload_all_continues_after_disable_hook_failure`）。若改成
   "失败即中止卸载"，会破坏 `unload_all` 的完整性，属重大变更。
 
 ### context.py / app.py
-- Context **除 `task` 外**全部方法返回 `self`；新增方法默认返回 `self`
-  且不抛业务异常。`task` 是 v1.1 的有意例外（返回 Task），见 ADR 9，
-  不要“顺手”改成链式。
+- Context **除 `use` / `use_strict` / `task` 外**全部方法返回 `self`；新增方法
+  默认返回 `self` 且不抛业务异常。`task`（v1.1）与 `use_strict`（v1.2）是有意
+  例外（分别返回 Task 与“取不到就抛”），见 ADR 9/16，不要“顺手”改成链式。
+- **`use()` 的 default 语义是冻结的**（ADR 16）：严格获取一律走 `use_strict`。
+  想直接改 `use()` 的，先回去读 maintenance.md 第 6 节与 CHANGELOG 1.2.0。
+- **v1.2 ctx 注入**：`load_all` / `load_one` 都在调用 `plugin.load()` 之前写
+  `plugin.ctx = ctx`。`Plugin.ctx` 只在 `if TYPE_CHECKING` 块内声明——运行时
+  没有这个类属性，因此**不要在契约层运行时 import Context**（会倒置架构 §2 的
+  依赖方向）。锁死用例：`test_plugin_ctx_injected_for_all_phases`、
+  `test_plugin_ctx_refreshed_after_restart`。
+- **v1.2 热插拔**：`App.load_plugin` / `unload_plugin` 都要求 App 已 start；
+  `unload_plugin` 在有依赖方时抛 `LifecycleError`（不做级联卸载）。锁死用例：
+  `test_app_hot_plug_requires_started_app`、
+  `test_app_unload_plugin_refuses_when_depended_on`。
 - `config` 切片是引用共享（对 app.config 的修改插件可见）--这是特性不是 bug，
   不要改成拷贝。
 - `App.start` 防重入、`stop` 幂等可重启，两条测试
@@ -178,6 +209,11 @@ pyproject.toml         pytest/coverage 配置
 实操要点：
 
 - **新增**（非破坏）：直接加，同步更新 `core_api.md` 与 `__init__.py` 导出，
+
+**已用的先例（v1.2，P2-2）**：外部评审建议把 `use()` 改成“未注册即抛”，
+这属破坏性变更。落地方式是不动 `use()`，**新增** `use_strict()` 作为过渡
+接口，并在 `exceptions.py` / `core_api.md` / CHANGELOG 里写明“v1.x 内不收紧
+`use()`，留待下一个主版本”。以后遇到同类“想改冻结语义”的需求，照这个模板走。
   补测试。
 - **修改签名/语义**（破坏性）：旧路径标注 `@deprecated`（docstring 中写明
   移除版本与迁移方法），新旧并存至少一个版本周期；`core_api.md` 记录
@@ -236,7 +272,7 @@ class MyFeature(Plugin):
         ctx.on_cleanup(self._close_file)   # 自定义清理，LIFO 执行
 
     async def enable(self) -> None:
-        db = self._ctx.use("db")           # 依赖已就绪
+        db = self.ctx.use_strict("db")           # 依赖已就绪；缺失即抛，便于排错
         ...
 
     async def disable(self) -> None: ...   # 停止对外活动

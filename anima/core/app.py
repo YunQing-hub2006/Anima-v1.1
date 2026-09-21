@@ -47,6 +47,38 @@ class App:
         """插件卸载完毕后丢弃其追踪器。"""
         self._effects.pop(plugin_name, None)
 
+    # -- 单插件热插拔（v1.2） ---------------------------------------------------------
+
+    async def load_plugin(self, plugin: Plugin) -> None:
+        """运行时加载并启用**单个**插件（热插拔，v1.2）。
+
+        要求 App 已 :meth:`start`；新插件的依赖只能指向**已经加载**的插件。
+        校验（空名、重名、依赖缺失）在任何 ``plugin.load()`` 之前完成，
+        失败时只回滚这一个插件——已经在跑的插件不受影响。
+
+        注意这是"新增后启用"，不是"重新启用"：重复加载同名插件抛
+        :class:`LifecycleError`。重启单个已卸载插件需要新实例。
+        """
+        if not self._started:
+            raise LifecycleError("App 未启动，不能加载单个插件")
+        await self.lifecycle.load_one(plugin)
+
+    async def unload_plugin(self, name: str) -> None:
+        """运行时卸载**单个**插件（热插拔，v1.2）。
+
+        若仍有已加载插件依赖它，抛 :class:`LifecycleError`——先卸依赖方。
+        直接放行会留下"服务已被注销、插件还在跑"的破洞状态，正是内核
+        一贯要避免的中间态。
+        """
+        if not self._started:
+            raise LifecycleError("App 未启动，不能卸载单个插件")
+        dependents = self.lifecycle.dependents_of(name)
+        if dependents:
+            raise LifecycleError(
+                f"插件 {name!r} 仍被依赖，无法卸载: {', '.join(dependents)}"
+            )
+        await self.lifecycle.unload(name)
+
     # -- 启动 / 停止 ---------------------------------------------------------
 
     async def start(self, plugins: list[Plugin]) -> None:

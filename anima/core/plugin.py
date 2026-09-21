@@ -17,6 +17,11 @@
 
 三个阶段方法都允许写成同步或异步（``def`` / ``async def``），
 内核会统一调度。
+
+框架在调用 ``load()`` **之前**把当前 :class:`Context` 注入
+``self.ctx``（v1.2），因此 ``load`` / ``enable`` / ``disable`` / ``unload`` 全阶段都能直接用
+``self.ctx``，不必再自己写 ``self._ctx = ctx``。重启（stop 后再 start）
+会用新的 Context 覆盖它。
 """
 
 from __future__ import annotations
@@ -45,6 +50,11 @@ class Plugin(ABC):
     name: str = ""
     version: str = "1.0.0"
     dependencies: ClassVar[Sequence[str]] = ()
+
+    if TYPE_CHECKING:
+        #: 框架在 ``load()`` 前注入（v1.2）。只在类型检查期声明，运行时
+        #: 不存在类属性——避免契约层反向 import 编排层（见架构 §2）。
+        ctx: Context
 
     @abstractmethod
     async def load(self, ctx: Context) -> None:

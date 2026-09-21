@@ -1,8 +1,8 @@
-# Anima 内核 API 参考（v1.1.2，已冻结）
+# Anima 内核 API 参考（v1.2.0，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
-> v1.1.2 变更摘要见文末"变更记录"。
+> v1.2.0 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -27,6 +27,9 @@ class Plugin(ABC):
     version: str = "1.0.0"
     dependencies: ClassVar[Sequence[str]] = ()   # 依赖插件的 name（v1.1.2）
 
+    if TYPE_CHECKING:                            # v1.2：框架在 load() 之前注入
+        ctx: Context                             # load/enable/disable/unload 全阶段可用
+
     @abstractmethod
     async def load(self, ctx: Context) -> None   # 只注册自己
     async def enable(self) -> None               # 可安全 use() 依赖
@@ -35,6 +38,12 @@ class Plugin(ABC):
 ```
 
 enable/disable/unload 允许子类写成同步 `def`，内核统一调度。
+
+`ctx` 注入（v1.2）：框架在调用 `load()` **之前**把该插件的 `Context` 注入
+`self.ctx`，因此三个阶段方法都能直接用 `self.ctx`，插件不必再自己
+`self._ctx = ctx`。重启（stop 后再 start）会注入新的 Context。该属性在
+`if TYPE_CHECKING:` 块内声明——只在类型检查期存在，运行时不产生类属性，
+以免契约层反向 import 编排层。
 
 `dependencies` 的默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
 v1.1.2 起）：旧实现用 `list[str] = []` 作类属性，所有子类共享同一个
@@ -59,6 +68,7 @@ class EventBus:
     def unsubscribe(self, event: str, handler: Handler) -> None   # 幂等
     def emit(self, event: str, data: Any = None) -> None          # 异常隔离
     def emit_async(self, event: str, data: Any = None) -> list[asyncio.Task]
+    async def emit_and_wait(self, event: str, data: Any = None) -> None  # v1.2
     def count(self) -> int          # 有效订阅总数
     def clear(self) -> None         # 清空全部订阅
 ```
@@ -77,6 +87,13 @@ class EventBus:
 抛异常时退回默认 logger，不会漏给发布方。`set_error_hook(None)` 恢复
 默认上报。
 
+线程安全（v1.2 强化）：订阅表由 `threading.RLock` 保护，`subscribe` /
+`unsubscribe` / `count` / `clear` / `_handlers` 都在锁内操作，**任意线程**
+增删订阅都是安全的。锁**绝不跨越 handler 执行**（`_handlers` 在锁内拷出列表后
+立即释放），因此 handler 里再 subscribe / emit 不会死锁，慢 handler 也不会
+阻塞其他线程的订阅。跨线程唤醒协程 handler 仍需使用者用
+`loop.call_soon_threadsafe`。
+
 ## 服务注册表 — `registry.py`
 
 ```python
@@ -84,6 +101,7 @@ class ServiceRegistry:
     def register(self, name: str, instance: Any) -> None   # 重名抛 ServiceExistsError
     def unregister(self, name: str) -> None                # 幂等
     def use(self, name: str, default: Any = None) -> Any   # 返回实例本身
+    def use_strict(self, name: str) -> Any                 # v1.2 未注册抛错
     def has(self, name: str) -> bool
     def list(self) -> list[str]                            # 服务名快照
     def clear(self) -> None
@@ -125,6 +143,7 @@ class Context:
     def emit(self, event: str, data: Any = None) -> Self
     def provide(self, name: str, instance: Any) -> Self
     def use(self, name: str, default: Any = None) -> Any
+    def use_strict(self, name: str) -> Any                       # v1.2
     def on_cleanup(self, callback: CleanupFn) -> Self
     def task(self, coro: Coroutine) -> asyncio.Task              # v1.1
 ```
@@ -148,6 +167,8 @@ class LifecycleManager:
     async def unload(self, name: str) -> None
     async def unload_all(self) -> None                          # 逆加载顺序
     def get_state(self, name: str) -> PluginState               # 未知按 unloaded
+    async def load_one(self, plugin: Plugin) -> None            # v1.2 单插件热插拔
+    def dependents_of(self, name: str) -> list[str]             # v1.2 直接依赖方
 ```
 
 状态机：`unloaded -> loaded -> enabled -> disabled -> unloaded`；
@@ -177,6 +198,8 @@ class App:
     async def stop(self) -> None                            # 幂等；可再次 start
     def effects_for(self, plugin_name: str) -> EffectTracker
     def discard_effects(self, plugin_name: str) -> None
+    async def load_plugin(self, plugin: Plugin) -> None        # v1.2 热插拔
+    async def unload_plugin(self, name: str) -> None           # v1.2 热插拔
 ```
 
 `start` 错误语义（v1.1.1 明确）：load/enable 中途失败时，生命周期层
@@ -215,14 +238,27 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 
 | 指标 | 目标 | 实测 |
 |---|---|---|
-| emit 平均耗时（1000 次均值） | < 0.1 ms | ~3.1 us |
-| 1000 handler 单次 emit（压力口径） | < 10 ms | ~1.2 ms |
-| 100 插件拓扑排序 | < 1 ms | ~0.13 ms |
-| 100 插件完整生命周期 | < 50 ms | ~2.2 ms |
-| EffectTracker 1000 项回滚 | < 10 ms | ~1.3 ms |
-| 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.1 KiB |
+| emit 平均耗时（1000 次均值） | < 0.1 ms | ~0.78 us |
+| 1000 handler 单次 emit（压力口径） | < 10 ms | ~0.29 ms |
+| 100 插件拓扑排序 | < 1 ms | ~0.07 ms |
+| 100 插件完整生命周期 | < 50 ms | ~0.47 ms |
+| EffectTracker 1000 项回滚 | < 10 ms | ~0.38 ms |
+| 空 App 内存（tracemalloc 峰值） | < 5 MB | ~1.6 KiB |
 
 ## 变更记录
+
+### v1.2.0（2026-09-08）
+
+迭代 2：总线健壮性与易用性。公共接口全部为**新增**（次版本号变更）。
+
+- `EventBus` 订阅表加 `RLock`（锁不跨越 handler 执行），新增 `emit_and_wait()`。
+- `Plugin.ctx` 在 `load()` 前自动注入，全阶段可用。
+- 新增 `ServiceRegistry.use_strict` / `Context.use_strict`：未注册抛
+  `ServiceNotFoundError`。**`use()` 的 default 语义冻结不变**，按
+  maintenance.md §6 走「新增过渡接口」而非破坏性收紧。
+- 新增 `App.load_plugin` / `App.unload_plugin` 与 `LifecycleManager.load_one`
+  / `dependents_of`：运行时单插件热插拔。
+- 规模口径改为 `raw < 1200` + `code < 650`；测试 136 -> 173 个。
 
 ### v1.1.2（2026-09-08）
 

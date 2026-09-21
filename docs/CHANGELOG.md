@@ -3,6 +3,73 @@
 所有显著变更记录于此文件。版本号遵循语义化版本规范；内核公共接口自
 v1.0 起冻结，任何破坏性变更需走 `maintenance.md` 第 6 节的评审流程。
 
+## [1.2.0] — 2026-09-08
+
+**迭代 2**：总线健壮性与易用性。公共接口全部为**新增**（次版本号变更）。
+唯一需要留意的语义决定是 P2-2：严格获取走新增的 `use_strict`，
+`use()` 的 default 语义按 maintenance.md §6 **保持冻结**。
+
+### 新增
+
+- **EventBus 线程安全（P1-2）**：订阅表由 `threading.RLock` 保护，
+  `subscribe` / `unsubscribe` / `count` / `clear` / `_handlers`
+  都在锁内操作。**锁绝不跨越 handler 执行**（`_handlers` 在锁内拷出
+  列表后立即释放），所以 handler 里再 subscribe / emit 不会死锁，慢
+  handler 也不会阻塞其他线程的订阅。这条取代了 v1.1 的"订阅只发生在
+  内核线程"口头约定——architecture.md §7 的结论随之改写（ADR 15）。
+- **`EventBus.emit_and_wait(event, data)`（P1-3）**：异步发布并等待全部
+  协程 handler 完成。`emit_async` 返回的 Task 列表一旦被调用方遗忘就
+  永远不会被 await、任务可能在 GC 时被静默丢弃；本方法是那个常见用法的
+  正确默认，协程 handler 的异常仍按 handler 隔离。
+- **`Plugin.ctx` 注入（P2-1）**：框架在调用 `load()` **之前**把
+  Context 注入 `self.ctx`，`load` / `enable` / `disable` /
+  `unload` 全阶段可用，插件不必再自己 `self._ctx = ctx`；重启会用
+  新的 Context 覆盖它。类型声明放在 `if TYPE_CHECKING:` 块内，运行时
+  不产生类属性——避免契约层反向 import 编排层。
+- **`ServiceRegistry.use_strict(name)` / `Context.use_strict(name)`
+  （P2-2）**：未注册时抛 `ServiceNotFoundError`（该异常从"预留"转为
+  实用）。按 maintenance.md §6 的迁移路径落地：`use()` 的 default 语义
+  在 v1.x 内**不变**，新代码用 `use_strict` 即可让"忘注册 / 拼错名字"
+  在**取用点**立刻暴露，将来 v2 真正收紧 `use()` 时也无需再改。
+- **`App.load_plugin(plugin)` / `App.unload_plugin(name)`（P2-3）**：
+  运行时装卸单个插件。配套新增 `LifecycleManager.load_one(plugin)`
+  （依赖可指向已加载插件、失败只回滚自己）与
+  `LifecycleManager.dependents_of(name)`。`unload_plugin` 在有插件
+  依赖该插件时**拒绝执行**，避免留下"服务已注销、插件还在跑"的破洞状态。
+- **`examples/` 与回归测试（P4-4）**：`hello` / `dependency` /
+  `rollback` / `hot_reload` 四个可运行示例，加
+  `tests/test_core/test_rollback.py`（回滚路径集成）与
+  `test_examples.py`（示例不许腐烂：直接加载并 await 每个 `main()`）。
+
+### 修复
+
+- **`Context` 类 docstring**：原称"所有方法返回 self"，但 `use()` 从
+  来不返回 self——与 1.1.2 修的 P0-2 属同一类"文档与实现裂缝"，一并对齐
+  （`use` / `use_strict` / `task` 除外）。
+
+### 工具链
+
+- **规模口径改为两条**：`raw < 1200` 物理行 + `code < 650` 代码行
+  （去掉空行、注释行与 docstring）。原先单条 `raw < 1000` 在 docstring
+  变详细后开始失真——1.1.2 结束时 961 物理行其实只有约 500 行代码，而
+  迭代 2 的新增把它直接顶到 1104。拆分后：物理行防文件膨胀，代码行才是
+  "内核保持小巧"的真正守门指标。
+
+### 其他
+
+- 清理了误建在 `anima/core/Anima-v1.1/` 下的整仓副本（未纳入 git）。
+- 按 maintenance.md §7 的要求重新实测性能并更新 `core_api.md` /
+  `architecture.md` 的“实测”列（本次 emit 平均 0.78 µs、100 插件生命周期
+  0.47 ms、1000 项回滚 0.38 ms、空 App 峰值 1.6 KiB）。
+
+### 验收
+
+- 规模 **1104 物理行 / 553 代码行**（上限 1200 / 650）
+- 测试 136 -> **173 个**（+37：总线段 6、registry 3、context 3、
+  plugin 2、lifecycle 7、app 6、rollback 集成 9、示例 4，含参数化）
+- 覆盖率 **99%** 不变（lifecycle 98%，未覆盖 3 行仍是 v1.0 起的历史缺口）
+- `check_kernel_rules.py` 通过：纯标准库、无第三方 import
+
 ## [1.1.2] — 2026-09-08
 
 按外部评审的 P0/P1 清单修复正确性缺陷，并补上两项 P4 级工程化能力。

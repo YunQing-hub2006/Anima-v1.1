@@ -114,3 +114,50 @@ def test_dependencies_default_is_immutable_and_unshared():
     assert Sibling.dependencies == ()
     assert Plugin.dependencies == ()
 
+
+# ---------- v1.2: ctx 注入（P2-1） ----------
+
+
+async def test_plugin_ctx_injected_for_all_phases():
+    """框架在 load 之前注入 self.ctx，enable/disable/unload 都能直接用。"""
+    from anima.core.app import App
+
+    seen: list = []
+
+    class Consumer(Plugin):
+        name = "consumer"
+
+        async def load(self, ctx: Context) -> None:
+            assert self.ctx is ctx
+
+        async def enable(self) -> None:
+            seen.append(self.ctx)
+
+        async def disable(self) -> None:
+            seen.append(self.ctx)
+
+        async def unload(self) -> None:
+            seen.append(self.ctx)
+
+    app = App()
+    plugin = Consumer()
+    await app.start([plugin])
+    await app.stop()
+
+    assert len(seen) == 3
+    assert all(ctx is plugin.ctx for ctx in seen)
+
+
+async def test_plugin_ctx_refreshed_after_restart():
+    """stop 后再 start 同一实例：注入的是新的 Context。"""
+    from anima.core.app import App
+
+    plugin = MinimalPlugin()
+    app = App()
+    await app.start([plugin])
+    first = plugin.ctx
+
+    await app.stop()
+    await app.start([plugin])
+    assert plugin.ctx is not first
+    await app.stop()

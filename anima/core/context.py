@@ -18,9 +18,9 @@ __all__ = ["Context"]
 class Context:
     """每个插件在 ``load()`` 时独享一个 Context。
 
-    所有方法返回 ``self`` 以支持链式调用。通过 ``on()`` / ``provide()``
-    产生的订阅与注册都会被 :class:`EffectTracker` 记录，插件卸载时自动
-    回滚；``config`` 是该插件在 ``app.config["plugins"]`` 下的私有切片。
+    除 ``use`` / ``use_strict`` / ``task``（按语义返回别的对象）外，所有方法返回 ``self`` 以支持链式
+    调用。通过 ``on()`` / ``provide()`` 产生的订阅与注册都会被 :class:`EffectTracker` 记录，
+    插件卸载时自动回滚；``config`` 是该插件在 ``app.config["plugins"]`` 下的私有切片。
     """
 
     app: "App"
@@ -62,6 +62,14 @@ class Context:
     def use(self, name: str, default: Any = None) -> Any:
         """获取其他插件提供的服务；不存在时返回 ``default``。"""
         return self.app.registry.use(name, default)
+
+    def use_strict(self, name: str) -> Any:
+        """获取其他插件提供的服务；未注册时抛 ``ServiceNotFoundError``（v1.2）。
+
+        ``use()`` 的 default 语义不变；新代码优先用本方法，可以在取用点
+        立刻发现"依赖方忘了 provide"或"名字拼错"。
+        """
+        return self.app.registry.use_strict(name)
 
     def on_cleanup(self, callback: CleanupFn) -> Self:
         """登记自定义清理操作，插件卸载时逆序执行。"""

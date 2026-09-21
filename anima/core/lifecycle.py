@@ -47,6 +47,10 @@ class LifecycleManager:
         """返回插件当前状态；未知插件按 ``unloaded`` 处理。"""
         return self._states.get(name, _UNLOADED)
 
+    def dependents_of(self, name: str) -> list[str]:
+        """返回当前已加载插件中直接依赖 `name` 的名字（v1.2，热插拔用）。"""
+        return [other.name for other in self._plugins.values() if name in other.dependencies]
+
     def _require(self, name: str) -> Plugin:
         plugin = self._plugins.get(name)
         if plugin is None:
@@ -79,6 +83,7 @@ class LifecycleManager:
         try:
             for plugin in ordered:
                 ctx = Context(self._app, plugin)
+                plugin.ctx = ctx  # v1.2：生命周期全阶段可用的注入
                 self._plugins[plugin.name] = plugin
                 self._states[plugin.name] = _LOADED
                 self._load_order.append(plugin.name)
@@ -134,6 +139,45 @@ class LifecycleManager:
         raise exc
 
     # -- 单插件操作 ---------------------------------------------------------
+
+    async def load_one(self, plugin: Plugin) -> None:
+        """运行时加载并启用**单个**插件（热插拔，v1.2）。
+
+        与 :meth:`load_all` 的两点不同：
+
+        - 依赖只需指向**已经加载**的插件，不必同批传入；
+        - 失败回滚只回滚这一个插件，已经在跑的插件完全不受影响。
+
+        校验（空名、重名、依赖缺失）仍然在任何 `plugin.load()` 之前完成。
+        失败时原始异常原样抛出；回滚自身的清理失败则聚合进
+        :class:`RollbackError`（`__cause__` 指向原始异常）。
+        """
+        if not plugin.name:
+            raise LifecycleError("插件 name 不能为空")
+        if plugin.name in self._plugins:
+            raise LifecycleError(f"插件重复注册: {plugin.name!r}")
+        missing = [dep for dep in plugin.dependencies if dep not in self._plugins]
+        if missing:
+            raise DependencyError(
+                f"插件 {plugin.name!r} 依赖的 {missing[0]!r} 不在已加载插件中"
+            )
+
+        ctx = Context(self._app, plugin)
+        plugin.ctx = ctx
+        self._plugins[plugin.name] = plugin
+        self._states[plugin.name] = _LOADED
+        self._load_order.append(plugin.name)
+        try:
+            await _call(plugin.load, ctx)
+            await self.enable(plugin.name)
+        except BaseException as exc:
+            # 只回滚这一个插件——_raise_with_rollback_errors 会卸载全部，
+            # 那对热插拔是灾难性的。
+            try:
+                await self.unload(plugin.name)
+            except RollbackError as rollback_exc:
+                raise RollbackError(rollback_exc.errors) from exc
+            raise
 
     async def enable(self, name: str) -> None:
         """启用插件；仅 ``loaded`` / ``disabled`` 状态合法。"""

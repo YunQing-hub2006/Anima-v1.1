@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 from anima.core.bus import EventBus
 
@@ -295,3 +296,124 @@ def test_handler_order_contract(bus: EventBus):
     bus.emit("evt.click", None)
 
     assert calls == ["exact-1", "exact-2", "wild-1", "wild-2", "wild-3"]
+
+# ---------- v1.2: 线程安全（P1-2）与 emit_and_wait（P1-3） ----------
+
+
+def test_lock_is_not_held_during_handler_execution():
+    """锁不跨越 handler 执行：handler 卡住时其他线程仍能订阅。"""
+    bus = EventBus()
+    entered = threading.Event()
+    release = threading.Event()
+    subscribed = threading.Event()
+
+    def blocking(_):
+        entered.set()
+        release.wait(timeout=5)
+
+    def noop(_):
+        pass
+
+    bus.subscribe("evt", blocking)
+    emitter = threading.Thread(target=lambda: bus.emit("evt", None))
+    emitter.start()
+    assert entered.wait(timeout=5)
+
+    def subscribe_from_other_thread():
+        bus.subscribe("other", noop)
+        subscribed.set()
+
+    worker = threading.Thread(target=subscribe_from_other_thread)
+    worker.start()
+    try:
+        assert subscribed.wait(timeout=5), "锁被 handler 持有：subscribe 被阻塞"
+    finally:
+        release.set()
+        emitter.join(timeout=5)
+        worker.join(timeout=5)
+    assert not emitter.is_alive()
+
+
+def test_handler_can_subscribe_reentrantly():
+    """handler 内部再 subscribe 不会被吞掉（锁不跨越执行，无死锁）。"""
+    bus = EventBus()
+    seen: list = []
+
+    def outer(_):
+        bus.subscribe("follow-up", lambda d: seen.append(d))
+
+    bus.subscribe("kick", outer)
+    bus.emit("kick", None)
+    bus.emit("follow-up", 7)
+    assert seen == [7]
+
+
+def test_concurrent_subscribe_unsubscribe_stress():
+    """4 线程两阶段并发增删通配订阅：不抛异常，收尾订阅表回到空。"""
+    bus = EventBus()
+    rounds = 150
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(4)
+
+    def worker(tag: int) -> None:
+        try:
+            mine = [lambda d, t=tag, i=i: None for i in range(rounds)]
+            barrier.wait(timeout=5)
+            for h in mine:
+                bus.subscribe("evt.*", h)
+            barrier.wait(timeout=5)
+            for h in mine:
+                bus.unsubscribe("evt.*", h)
+        except BaseException as exc:  # pragma: no cover - 竞态失败路径
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert errors == []
+    assert all(not t.is_alive() for t in threads)
+    assert bus.count() == 0
+
+
+async def test_emit_and_wait_awaits_coroutine_handlers():
+    """emit_and_wait 等到全部协程 handler 跑完才返回。"""
+    bus = EventBus()
+    done: list = []
+
+    async def slow(d):
+        await asyncio.sleep(0)
+        done.append(d)
+
+    async def also_slow(d):
+        done.append(("second", d))
+
+    bus.subscribe("evt", slow)
+    bus.subscribe("evt", also_slow)
+    await bus.emit_and_wait("evt", 5)
+    assert sorted(map(str, done)) == sorted(map(str, [5, ("second", 5)]))
+
+
+async def test_emit_and_wait_isolates_handler_exceptions():
+    """协程 handler 崩溃不影响其他 handler，也不上抛给调用方。"""
+    bus = EventBus()
+    seen: list = []
+
+    async def boom(d):
+        raise RuntimeError("异步 handler 崩了")
+
+    bus.subscribe("evt", boom)
+    bus.subscribe("evt", lambda d: seen.append(d))
+    await bus.emit_and_wait("evt", 1)
+    assert seen == [1]
+
+
+async def test_emit_and_wait_without_coroutine_handlers():
+    """没有协程 handler 时 emit_and_wait 立即返回且不抛异常。"""
+    bus = EventBus()
+    seen: list = []
+    bus.subscribe("evt", lambda d: seen.append(d))
+    await bus.emit_and_wait("evt", 1)
+    assert seen == [1]

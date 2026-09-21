@@ -480,3 +480,73 @@ def _noop():
     """供 lambda 排序钩子返回的空协程占位。"""
     return None
 
+
+# ---------- v1.2: 单插件热插拔 load_one（P2-3） ----------
+
+
+async def test_load_one_loads_and_enables(app: App):
+    """load_one 把单个插件推进到 enabled，并注入 ctx。"""
+    plugin = make_plugin("late")
+    await app.lifecycle.load_one(plugin)
+
+    assert app.lifecycle.get_state("late") == "enabled"
+    assert plugin.calls == ["load", "enable"]
+    assert plugin.ctx is not None
+
+
+async def test_load_one_rejects_empty_name_and_duplicates(app: App):
+    """空名与重名都在任何 load() 之前被拦下。"""
+    with pytest.raises(LifecycleError):
+        await app.lifecycle.load_one(make_plugin(""))
+
+    plugin = make_plugin("dup")
+    await app.lifecycle.load_one(plugin)
+    with pytest.raises(LifecycleError):
+        await app.lifecycle.load_one(make_plugin("dup"))
+
+
+async def test_load_one_rejects_dependency_not_loaded(app: App):
+    """依赖不在已加载集合里 -> DependencyError，且不执行 load()。"""
+    orphan = make_plugin("orphan", dependencies=["ghost"])
+    with pytest.raises(DependencyError):
+        await app.lifecycle.load_one(orphan)
+    assert orphan.calls == []
+
+
+async def test_load_one_accepts_dependency_already_loaded(app: App):
+    """热插拔插件可以依赖已经在跑的插件。"""
+    await app.lifecycle.load_one(make_plugin("db"))
+
+    api = make_plugin("api", dependencies=["db"])
+    await app.lifecycle.load_one(api)
+    assert app.lifecycle.get_state("api") == "enabled"
+
+
+async def test_load_one_failure_rolls_back_only_new_plugin(app: App):
+    """新插件 load 失败时，已在跑的插件完全不受影响。"""
+    await app.lifecycle.load_one(make_plugin("running"))
+
+    class BadLoad(Plugin):
+        name = "bad"
+
+        async def load(self, ctx: Context) -> None:
+            ctx.provide("bad-svc", 1)
+            raise RuntimeError("热插拔失败")
+
+    with pytest.raises(RuntimeError):
+        await app.lifecycle.load_one(BadLoad())
+
+    assert app.lifecycle.get_state("bad") == "unloaded"
+    assert app.lifecycle.get_state("running") == "enabled"
+    assert app.registry.has("bad-svc") is False
+    assert app.effects_for("running").count() == 0
+
+
+async def test_dependents_of_lists_direct_dependents(app: App):
+    """dependents_of 只报直接依赖方。"""
+    await app.lifecycle.load_one(make_plugin("db"))
+    assert app.lifecycle.dependents_of("db") == []
+
+    await app.lifecycle.load_one(make_plugin("api", dependencies=["db"]))
+    assert app.lifecycle.dependents_of("db") == ["api"]
+    assert app.lifecycle.dependents_of("api") == []

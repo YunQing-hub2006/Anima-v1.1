@@ -1,4 +1,4 @@
-# Anima 内核架构设计（v1.1.2）
+# Anima 内核架构设计（v1.2.0）
 
 > 本文是内核的正式架构设计文档，配合 [core_api.md](core_api.md)（接口签名）
 > 与 [maintenance.md](maintenance.md)（开发维护指南）使用。
@@ -6,6 +6,8 @@
 > v1.1 相对 v1.0 仅新增接口（`push_task`/`Context.task`）与线程语义
 > 文档化，详见 core_api.md 变更记录。v1.1.2 为正确性修复 + 异常上报与
 > 日志出口，同属非破坏性变更。
+> v1.2 为总线健壮性（加锁）与易用性（ctx 注入 / use_strict / 热插拔），
+> 同样只新增接口。
 
 ---
 
@@ -14,7 +16,7 @@
 | 维度 | 目标 | 达成情况 |
 |---|---|---|
 | 依赖 | 零外部依赖，`core/` 只 import 标准库 | ✅ 由 `check_kernel_rules.py` 自动检查 |
-| 规模 | `core/` < 1000 行 | ✅ 961 行（余量 39，见 §10 预算告警） |
+| 规模 | `core/` raw < 1200 / code < 650 | ✅ 1104 物理行 / **553 代码行** |
 | 类型 | 所有公共接口类型注解完整 | ✅ |
 | 测试 | 每模块行覆盖率 >= 90% | ✅ 总体 99%，最低模块 98% |
 | 性能 | 见第 8 节基准表 | ✅ 全部达标 |
@@ -52,6 +54,11 @@
 依赖方向自上而下单向依赖；编排层内部 `App -> LifecycleManager -> Context`
 反向通过构造注入（`LifecycleManager(app)`）避免循环 import，
 跨模块类型引用一律走 `from __future__ import annotations` + `TYPE_CHECKING`。
+
+`Plugin.ctx` 是这条规则的一个特例（v1.2）：它由编排层注入，却在契约层
+声明为 `if TYPE_CHECKING:` 块内的注解——类型检查器看得见，运行时不存在
+类属性，因此契约层不需要运行时 import 编排层，依赖方向保持不变。
+
 ## 3. 组件关系图
 
 ```
@@ -135,10 +142,24 @@ _wild:  list[tuple[prefix, Handler]]    # 通配订阅，emit 时线性扫描
 `anima.bus` logger。`_report` 整体包在 try/except 内——钩子是用户
 代码，它崩了也只能写日志，绝不把异常漏给发布方。
 
+**线程安全（v1.2）**：订阅表由 `threading.RLock` 保护。关键是**锁不
+跨越 handler 执行**——`_handlers` 在锁内拷出列表后立即释放，handler 仍在
+调用方线程运行。这样既保证了任意线程增删订阅安全，又不会让慢 handler
+阻塞别人的订阅、也不会让 handler 内的 subscribe 死锁（ADR 15）。
+
+**`emit_and_wait`（v1.2）**：`emit_async` 的配套便捷方法——
+`emit_async` 把协程 handler 包成 Task 返回，调用方一旦忘记 await，任务就可能
+在 GC 时被静默丢弃；`emit_and_wait` 内部 `gather(return_exceptions=True)`，
+是“发布并等它跑完”这个常见用法的正确默认。
+
 ### 4.4 registry.py — 服务注册表
 
 薄字典封装，三个关键语义：重复注册抛 `ServiceExistsError`（防止隐性覆盖）、
 `unregister` 幂等（与回滚路径配合，重复回滚安全）、`use` 返回实例本身不包装。
+
+v1.2 增加**严格获取** `use_strict(name)`：未注册时抛 `ServiceNotFoundError`。
+`use()` 的 default 语义不变——它是冻结接口，收紧属破坏性变更（ADR 16）。
+
 ### 4.5 effects.py — 副作用追踪
 
 LIFO 栈 + 逐项回滚：
@@ -156,6 +177,11 @@ LIFO 栈 + 逐项回滚：
 - 全部方法返回 `self` 支持链式调用；`on/provide/on_cleanup` 自动登记回滚。
 - `config` 是 `app.config["plugins"][plugin.name]` 的**引用切片**：缺失时
   自动建空 dict，各插件子 dict 天然隔离；`start` 前注入的配置对插件可见。
+- **v1.2 `ctx` 注入**：框架在 `load()` 前写 `plugin.ctx = ctx`，
+  三个阶段方法都能直接用 `self.ctx`，插件不必自己保存 load 的参数；
+  重启（stop 后再 start）会注入新的 Context。
+- **v1.2 `use_strict()`**：取不到服务就抛，把“忘 provide / 拼错名字”
+  从“使用时才炸”提前到“取用点就炸”。
 
 ### 4.7 lifecycle.py — 生命周期管理器（内核最复杂的模块）
 
@@ -197,6 +223,11 @@ unloaded ──load──> loaded ──enable──> enabled
   `bus.clear() -> registry.clear() -> effects 清空 -> _started=False`；
   未启动时是空操作，stop 后可再次 start（可重启、不泄漏）。
 - start 因依赖错误失败后，`stop` 仍可安全调用（幂等兜底）。
+- **单插件热插拔（v1.2）**：`load_plugin(plugin)` / `unload_plugin(name)` 在
+  运行中装卸单个插件，要求 App 已 `start`。新插件的依赖只能指向**已加载**
+  的插件；加载失败只回滚这一个插件（`load_one`），不会波及在跑的插件。
+  `unload_plugin` 在仍有插件依赖目标时抛 `LifecycleError`（不做级联卸载）——
+  直接放行会留下“服务已注销、插件还在跑”的破洞状态。
 
 ---
 
@@ -219,6 +250,8 @@ unloaded ──load──> loaded ──enable──> enabled
 |---|---|---|
 | 单个事件 handler 抛异常 | **隔离**（不上抛），其他 handler 照常；经 `on_error` 上报（默认 `anima.bus` logger） | 发布方不应为订阅者买单，但也不该无声失败 |
 | `on_error` 上报钩子自身抛异常 | 隔离，退回默认 logger 上报 | 上报路径不得破坏 emit 的"永不失败"契约 |
+| `use_strict` 取不到服务 | 抛 `ServiceNotFoundError` | 严格获取的语义就是"取不到即失败"，与 `use` 的 default 语义并存 |
+| `unload_plugin` 仍有依赖方 | 抛 `LifecycleError`，拒绝卸载 | 宁可拒绝也不留破洞中间态（同 ADR 2 检测前移） |
 | 单个 cleanup 抛异常 | 继续回滚剩余项，最后聚合 | 回滚完整性 > 单项成功 |
 | `plugin.unload()` 抛异常 | 收集进 RollbackError，状态仍 unloaded | 不让坏插件卡死全局 |
 | 依赖缺失/循环 | 加载前抛 DependencyError | 插件代码执行前拦截 |
@@ -304,21 +337,25 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 
 ## 7. 并发模型
 
-- **v1.1 线程语义（正式结论）**：`EventBus`、`ServiceRegistry`、
-  `EffectTracker` 内部是普通 dict/list，未加锁；但单个 `emit` /
-  `subscribe` / `unregister` 调用是纯同步代码，**无 await 临界区**，
-  在 CPython GIL 下是原子的。因此：
+- **线程语义（v1.2 定稿）**：`EventBus` 的订阅表由 `threading.RLock` 保护，
+  `subscribe` / `unsubscribe` / `count` / `clear` / `_handlers` 都在锁内
+  操作，因此**任意线程增删订阅都是安全的**。v1.1 时这条只靠“订阅只发生在
+  内核线程”的口头约定，v1.2 起由代码保证。
+  - **锁不跨越 handler 执行**：`_handlers` 在锁内拷出列表后立即释放，
+    handler 在**调用方线程**运行。因此 handler 里再 subscribe / emit 不会
+    死锁，慢 handler 也不会阻塞其他线程的订阅——这是加锁方案能成立的前提
+    （ADR 15）。
   - **从任意线程同步调用 `bus.emit` 是安全的**——handler 在**调用方线程**
     立即执行（AnimaPet 的 Qt 主线程 emit → 规则引擎同步触发 → bridge
     同步更新 UI，全程不离开调用线程）。
   - **跨线程 `emit` 的协程 handler 不会被调度**：调度依赖
-    `asyncio.get_running_loop()`，它是线程局部的；UI 线程没有运行中的
-    内核循环时，协程结果被丢弃（与 v1.0 行为一致）。
-  - **危险模式是多线程并发 subscribe 同一事件**造成的 list 竞争。
-    框架层约定：**订阅只发生在插件 load/unload（内核线程）**，
-    UI 线程只 emit。该约定写入了 bus.py 的模块 docstring。
-- **多线程并发 use/register** 不安全：ServiceRegistry 同理约定由
-  内核线程独占写入；`use`（只读 dict.get）从任意线程安全。
+    `asyncio.get_running_loop()`，它是线程局部的；UI 线程没有运行中的内核
+    循环时，协程结果被丢弃（与 v1.0 行为一致）。需要跨线程唤醒协程时仍由
+    使用者用 `loop.call_soon_threadsafe`。
+  - `count()` 是瞬时快照：并发增删下只保证“某一刻的近似值”。
+- **`ServiceRegistry` / `EffectTracker` 未加锁**：二者仍约定由内核线程独占写入
+  （插件 load/unload 都发生在内核线程）；`use`（只读 dict 查找）从任意线程安全。
+  EventBus 是唯一被 UI 线程直接触碰的组件，所以只有它需要锁。
 - `emit` 在无运行循环时收到协程 handler 会丢弃该协程（并 close），
   保证同步上下文调用永不失败。
 - 真正的 `emit_threadsafe` 网关仍登记为演进方向（见 §10），v1.1 不提供。
@@ -329,16 +366,22 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 
 | 决策 | 收益 | 实测 |
 |---|---|---|
-| 精确事件 dict 索引 | O(1) 查找 | emit 平均 **3.2 µs**（目标 <100µs） |
+| 精确事件 dict 索引 | O(1) 查找 | emit 平均 **0.78 µs**（目标 <100µs） |
 | 通配独立列表（非逐模式正则） | 扫描成本与订阅数线性 | 200 通配下精确事件不受影响 |
-| Kahn 排序 O(V+E)，入度数组 | 100 插件 **0.13 ms**（目标 <1ms） |
-| 回滚为简单 pop 循环 | 1000 项 **1.3 ms**（目标 <10ms） |
-| App 惰性创建 effects | 空 App 峰值 **0.8 KiB**（目标 <5MB） |
-| 100 插件完整生命周期 | 全流程 **2.2 ms**（目标 <50ms） |
+| Kahn 排序 O(V+E)，入度数组 | 100 插件 **0.07 ms**（目标 <1ms） |
+| 回滚为简单 pop 循环 | 1000 项 **0.38 ms**（目标 <10ms） |
+| App 惰性创建 effects | 空 App 峰值 **1.6 KiB**（目标 <5MB） |
+| 100 插件完整生命周期 | 全流程 **0.47 ms**（目标 <50ms） |
 
 注：计划中"1000 handler emit <0.1ms"按其"测 1000 次取平均"口径执行；
 1000-handler 单次 emit 作为压力项单独设 10ms 上限（实测 1.2ms）。
 基准脚本位于 `tests/test_core/test_performance.py`，阈值含 5 倍安全系数。
+
+v1.2 给订阅表加锁后实测 emit 平均 **0.78 µs**，仍远低于 <100 µs 目标——锁只在
+开头读一次订阅表，**不在 handler 执行期间持有**，因此与 handler 的耗时无关。
+本次数值与表中历史值（v1.0 记录为 3.1 µs）差异主要来自机器与测法，按 §7 的
+约定：**阈值才是回归依据，绝对值只作参考**。
+
 ---
 
 ## 9. 设计决策记录（ADR 摘要）
@@ -390,6 +433,22 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
     的节点包含"仅被环拖累"的下游插件。报出它们会把排查者引向无辜
     插件，因此额外用三色 DFS 回溯一条真实环路，消息即
     `a -> b -> a`。
+15. **v1.2 给 EventBus 加锁，并推翻 v1.1 的“不加锁”结论**：v1.1 明确写了
+    “总线内部无锁……危险模式是多线程并发 subscribe，框架层约定订阅只发生在
+    内核线程”，甚至提示“避免后人误加锁”。该结论在“所有订阅都来自内核线程”
+    成立时正确，但它是**约定而非机制**——一旦有人从 UI 线程订阅（或未来出现
+    热重载线程），就是难以复现的竞态。v1.2 用 RLock 把它变成机制，同时靠
+    “锁内拷贝、锁外执行”保住 v1.1 真正在意的两件事：handler 仍在调用方线程
+    运行、慢 handler 不阻塞任何人。ADR 的结论可以改，但必须写清为什么改。
+16. **v1.2 用 `use_strict` 而不是收紧 `use()`**：外部评审把“use() 未注册返回
+    None 导致错误延迟暴露”列为易用性问题，建议改成抛异常。这是破坏性变更
+    （调用方的错误处理会失效），按 maintenance.md §6 只能走“新增过渡接口”——
+    于是加 `use_strict()`，`use()` 的 default 语义冻结到下一个主版本。这是
+    §6 流程的第一个实际用例。
+17. **v1.2 热插拔的失败半径与卸载守卫**：`load_one` 失败**只回滚自己**——绝不能
+    复用它家的 `_raise_with_rollback_errors`，那会把整台 App 卸掉；
+    `unload_plugin` 在有依赖方时**拒绝执行**而非级联卸载——级联会静默卸掉
+    用户没点名的插件，比直接报错更难排查。
 
 ---
 
@@ -397,17 +456,19 @@ emit_async: 同上，协程包装为 Task 返回给调用方 gather
 
 | 方向 | 说明 | 接入点 |
 |---|---|---|
-| 线程安全总线 | `emit_threadsafe()` 经 `loop.call_soon_threadsafe`（v1.1 已文档化跨线程同步 emit 安全，此项为协程 handler 的跨线程调度网关） | bus.py |
-| 严格服务获取 | `use_strict()` 抛 `ServiceNotFoundError`（已预留） | registry.py |
+| 线程安全总线 | ✅ 订阅表已加锁（v1.2）；剩余的 `emit_threadsafe()`（协程 handler 的跨线程调度网关）未做 | bus.py |
+| 严格服务获取 | ✅ v1.2 已实施：`use_strict()` 抛 `ServiceNotFoundError`，`use()` 语义冻结 | registry.py |
+| 单插件热插拔 | ✅ v1.2 已实施：`App.load_plugin` / `unload_plugin`（替换式重载仍需新实例） | app.py |
 | 类型形式 provide/use | `ctx.provide(ConfigService, ...)`（v1.1 登记为框架层封装，不进内核） | plugins 层 |
 | 插件热重载 | 文件监听属 `anima/plugins/hotreload.py`，内核不需改动 | plugins/ |
 | 事件优先级/延迟 | handler 包装排序（v1.1.1 已移除 `_wild_matches` 内的不可观察排序钩子；真实优先级需显式设计执行顺序） | bus.py |
 | 条件启用 | config 切片加 `enabled: false` 约定 | lifecycle.py |
 
-> ⚠️ **行数预算告警（v1.1.2 起）**：内核已是 961/1000 行，余量仅 39 行。
-> 上表方向合计约 90 行（锁 + 优先级 + 采集 + 生命周期事件 + 热插拔），
-> **不可能一次性全部落进内核**。实施前必须先决策：精简 docstring、把
-> 非内核关注点移到 `anima/utils/`，或正式上调上限并同步修改
-> `check_kernel_rules.py` 与铁律第 8 条。
+> **规模口径（v1.2 起）**：`check_kernel_rules.py` 强制两条——`raw < 1200` 物理
+> 行 + `code < 650` 代码行（去掉空行、注释与 docstring）。原先单条
+> `raw < 1000` 在 docstring 变详细后开始失真：1.1.2 结束时 961 物理行其实只有
+> 约 500 行代码，而迭代 2 的新增直接把它顶到 1104。拆分后物理行防文件膨胀，
+> **代码行才是“内核保持小巧”的守门指标**。当前 1104 / 553，余量约 96 物理行、
+> 97 代码行。
 
 任何演进若改动冻结接口，必须走第 6 节（维护指南）的变更评审流程。

@@ -9,6 +9,7 @@ import pytest
 
 from anima.core.app import App
 from anima.core.context import Context
+from anima.core.exceptions import ServiceNotFoundError
 from anima.core.plugin import Plugin
 from tests.test_core.conftest import RecorderPlugin
 
@@ -227,3 +228,22 @@ def test_context_task_without_loop_raises(app: App):
         ctx.task(coro)
     coro.close()
 
+
+# ---------- v1.2: use_strict 过渡接口（P2-2） ----------
+
+
+def test_context_use_strict_raises_when_missing(app: App):
+    """use_strict 未注册时抛 ServiceNotFoundError（不是返回 None）。"""
+    ctx = _make_ctx(app)
+    with pytest.raises(ServiceNotFoundError):
+        ctx.use_strict("nope")
+
+
+def test_context_use_strict_returns_service(app: App):
+    """use_strict 命中时返回实例，且不影响 use 的 default 语义。"""
+    ctx = _make_ctx(app, RecorderPlugin("provider"))
+    ctx.provide("svc", 42)
+
+    assert ctx.use_strict("svc") == 42
+    assert ctx.use("svc") == 42
+    assert ctx.use("missing") is None  # 冻结语义不变
