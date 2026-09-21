@@ -1,8 +1,8 @@
-# Anima 内核 API 参考（v1.3.0，已冻结）
+# Anima 内核 API 参考（v1.3.1，已冻结）
 
 > 所有接口位于 `anima.core`，通过 `from anima.core import ...` 使用。
 > 本文档为接口冻结版；任何公共接口变更需走评审流程。
-> v1.3.0 变更摘要见文末"变更记录"。
+> v1.3.1 变更摘要见文末"变更记录"。
 
 ## 异常体系 — `exceptions.py`
 
@@ -29,7 +29,7 @@ class Plugin(ABC):
     dependencies: ClassVar[Sequence[str]] = ()   # 依赖插件的 name（v1.1.2）
 
     if TYPE_CHECKING:                            # v1.2：框架在 load() 之前注入
-        ctx: Context                             # load/enable/disable/unload 全阶段可用
+        ctx: Context                             # **保留属性名**；load/enable/disable/unload 全阶段可用（v1.3.1）
 
     @abstractmethod
     async def load(self, ctx: Context) -> None   # 只注册自己
@@ -48,6 +48,10 @@ enable/disable/unload 允许子类写成同步 `def`，内核统一调度。
 `config_defaults`（v1.3）：声明本插件需要的配置项及默认值，框架在
 `load()` 前把**缺失**的 key 填进 `ctx.config`（显式配置优先）。默认值是只读
 映射（`MappingProxyType`），子类只能整体覆盖，不能就地写脏。
+
+`ctx` 是**保留属性名**（v1.3.1 明确）：框架会写 `plugin.ctx`，子类不要声明自己
+的 `ctx`——只读 property 会让注入失败，报 `LifecycleError`（v1.3.1 前是裸的
+`AttributeError`，看不出原因）。
 以免契约层反向 import 编排层。
 
 `dependencies` 的默认值是**不可变元组**（`ClassVar[Sequence[str]] = ()`，
@@ -292,6 +296,12 @@ RollbackError, ServiceExistsError, ServiceNotFoundError, ServiceRegistry`
 ## 变更记录
 
 ### v1.3.0（2026-09-08）
+### v1.3.1（2026-09-08）
+
+- `ctx` 明确为保留属性名（`Plugin` 类 docstring），注入失败改抛可操作的
+  `LifecycleError`（此前是裸 `AttributeError`）。
+- 规模 1196 -> 1197 物理行 / 622 代码行；测试 199 -> 200 个。
+
 
 编排能力，全部为**新增**接口：
 

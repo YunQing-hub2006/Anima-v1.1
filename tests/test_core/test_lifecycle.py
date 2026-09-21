@@ -603,3 +603,25 @@ async def test_lifecycle_events_cover_hot_plug(app: App):
     await app.stop()
 
     assert seen == ["resident", "resident", "late", "late", "late", "resident"]
+
+# ---------- v1.3.1: ctx 是保留属性名 ----------
+
+
+async def test_plugin_with_readonly_ctx_gives_actionable_error(app: App):
+    """插件自己声明只读 ctx 时要报人话——ctx 是内核保留属性名。"""
+
+    class ReadOnlyCtx(Plugin):
+        name = "readonly-ctx"
+
+        def __init__(self) -> None:
+            self._ctx = None
+
+        @property
+        def ctx(self):  # type: ignore[override]
+            return self._ctx
+
+        async def load(self, ctx: Context) -> None:
+            ...
+
+    with pytest.raises(LifecycleError, match="保留属性名"):
+        await app.start([ReadOnlyCtx()])

@@ -48,6 +48,8 @@ class Plugin(ABC):
             （元组或列表都可赋值；列表在声明式元数据下同样安全）。
         config_defaults: 配置项及默认值（v1.3）；框架在 ``load()`` 前把缺失的
             key 填进 ``ctx.config``。只声明，默认值是不可写映射。
+        ctx: 框架在 ``load()`` 前注入的 Context（v1.2）。**保留属性名**：
+            子类不要声明自己的 ``ctx``——只读 property 会让注入直接失败。
     """
 
     name: str = ""
@@ -56,8 +58,9 @@ class Plugin(ABC):
     config_defaults: ClassVar[Mapping[str, Any]] = MappingProxyType({})
 
     if TYPE_CHECKING:
-        #: 框架在 ``load()`` 前注入（v1.2）。只在类型检查期声明，运行时
-        #: 不存在类属性——避免契约层反向 import 编排层（见架构 §2）。
+        #: 框架在 ``load()`` 前注入（v1.2）；``ctx`` 是**保留属性名**（见类 docstring）。
+        #: 只在类型检查期声明，运行时不产生类属性——避免契约层反向 import
+        #: 编排层（见架构 §2）。
         ctx: Context
 
     @abstractmethod

@@ -4,6 +4,33 @@
 v1.0 起冻结，任何破坏性变更需走 `maintenance.md` 第 6 节的评审流程。
 
 ## [1.3.0] — 2026-09-08
+## [1.3.1] — 2026-09-08
+
+补丁版：把 `ctx` 是**保留属性名**写进契约，并让违反时的报错说人话。
+
+### 修复
+
+- **`ctx` 明确为保留属性名**：`Plugin` 的类 docstring 补上 `ctx` 条目——
+  框架在 `load()` 前注入，子类不要声明自己的 `ctx`。下游 `AnimaPet` 的内嵌
+  内核就撞过：`FeatureAdapter` 把 `ctx` 写成只读 property，v1.2 的注入直接
+  `AttributeError`，表现为**所有 feature 模组装载失败**。
+- **注入失败改为可操作报错**：新增 `LifecycleManager._inject_ctx()`，把
+  `AttributeError` 转成 `LifecycleError`（"插件 'x' 的 ctx 不可写：ctx 是内核
+  保留属性名"）。此前只有一句裸的 `AttributeError: property 'ctx' of 'X'
+  object has no setter`，看不出该怎么办。
+
+### 其他
+
+- 为换回新增的行数，收紧了 `app.py` 的 `start` / `stop` docstring 与
+  `lifecycle.py` / `bus.py` / `effects.py` 的冗余措辞。规模 1196 ->
+  **1197 物理行 / 622 代码行**（上限 1200 / 650，物理行余量 3 行）。
+
+### 验收
+
+- 测试 199 -> **200 个**（新增 `test_plugin_with_readonly_ctx_gives_actionable_error`）
+- 覆盖率 **99%** 不变；`check_kernel_rules.py` 通过
+
+
 
 **迭代 3**：编排能力。全部为**新增**接口（次版本号变更），无破坏性改动。
 唯一的行为取舍：加了优先级之后，全零 priority 仍等价于纯注册顺序，由

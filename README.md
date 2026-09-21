@@ -1,4 +1,4 @@
-# Anima（v1.3.0）
+# Anima（v1.3.1）
 
 零外部依赖的 Python 插件内核。它只回答三个问题：**插件怎么活、怎么死、
 怎么通信**——插件生命周期管理、事件总线、服务注册表、副作用自动回滚，
@@ -6,8 +6,8 @@
 
 | | |
 |---|---|
-| **规模** | `anima/core/` 1196 物理行（其中**代码 617 行**；上限 1200 / 650） |
-| **测试** | 199 个，行覆盖率 **99%**（最低模块 98%） |
+| **规模** | `anima/core/` 1197 物理行（其中**代码 622 行**；上限 1200 / 650） |
+| **测试** | 200 个，行覆盖率 **99%**（最低模块 98%） |
 | **依赖** | 无（纯标准库） |
 | **Python** | >= 3.11 |
 | **类型** | 自带 `py.typed`（PEP 561），mypy / pyright 可直接读取内联注解 |
@@ -128,7 +128,7 @@ unloaded ──load──> loaded ──enable──> enabled
   请用 `use_strict()`。
 - **保留属性名**：`ctx` / `name` / `version` / `dependencies` /
   `config_defaults` 由框架读写，插件不要自己声明同名的**只读 property**
-  （框架写 `plugin.ctx` 会直接 `AttributeError`）。
+  （框架写 `plugin.ctx` 会失败；v1.3.1 起报带说明的 `LifecycleError`）。
 
 ---
 
@@ -136,7 +136,7 @@ unloaded ──load──> loaded ──enable──> enabled
 
 ```
 anima/
-├── core/               # 内核（纯标准库，1196 行 / 代码 617 行）
+├── core/               # 内核（纯标准库，1197 行 / 代码 622 行）
 │   ├── __init__.py     # 公共 API 导出
 │   ├── app.py          # App 组装器（start/stop、单插件热插拔）
 │   ├── bus.py          # EventBus 事件总线（通配、优先级、线程安全）
@@ -165,7 +165,7 @@ docs/
 ## 开发
 
 ```bash
-.venv/Scripts/python -m pytest tests/ -q                              # 199 个测试
+.venv/Scripts/python -m pytest tests/ -q                              # 200 个测试
 .venv/Scripts/python -m pytest tests/ --cov=anima.core --cov-report=term
 .venv/Scripts/python check_kernel_rules.py    # raw<1200 + code<650 + 无第三方 import
 .venv/Scripts/python examples/hello.py        # 跑一个最小示例

@@ -71,8 +71,7 @@ class EventBus:
     ``on_error`` 上报；未提供钩子时默认写 ``anima.bus`` logger。
     因此"订阅写错了"不会再完全无声。
 
-    订阅表由 ``_lock`` 保护，锁只在读写订阅表时持有、**绝不跨越 handler
-    执行**（详见模块 docstring 的"线程语义"）。
+    订阅表由 ``_lock`` 保护，且**绝不跨越 handler 执行**（见"线程语义"）。
     """
 
     def __init__(self, on_error: ErrorHook | None = None) -> None:

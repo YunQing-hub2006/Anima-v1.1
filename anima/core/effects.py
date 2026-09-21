@@ -35,8 +35,7 @@ class EffectTracker:
     def push_task(self, task: asyncio.Future[Any]) -> asyncio.Future[Any]:
         """登记一个后台任务，回滚时取消并等待其真正结束。
 
-        已结束的任务：已取消的跳过（视为正常收尾），其余 re-raise 其
-        异常进入 :class:`RollbackError` 聚合。
+        已结束的任务：已取消的跳过，其余 re-raise 异常进入 RollbackError 聚合。
         """
         if not isinstance(task, asyncio.Future):
             raise TypeError(f"push_task 需要 asyncio.Future/Task，得到 {type(task).__name__}")

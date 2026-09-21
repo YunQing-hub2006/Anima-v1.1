@@ -27,7 +27,7 @@ python -m venv .venv
 ## 2. 仓库地图
 
 ```
-anima/core/            内核（1196 物理行 / 617 代码行，纯标准库，接口已冻结）
+anima/core/            内核（1197 物理行 / 622 代码行，纯标准库，接口已冻结）
   app.py               组装器：start/stop、effects 持有者
   bus.py               事件总线：_exact dict + _wild 列表 + 异常上报钩子
   registry.py          服务注册表
@@ -38,7 +38,7 @@ anima/core/            内核（1196 物理行 / 617 代码行，纯标准库，
   exceptions.py        异常体系
 anima/plugins/         插件层（非内核）：discovery entry-point 自动发现（v1.3）
   log.py               日志出口（anima logger，v1.1.2）
-tests/                 199 个测试：test_core/ 按被测模块命名 + test_plugins/
+tests/                 200 个测试：test_core/ 按被测模块命名 + test_plugins/
   conftest.py          bus/registry/effects/app fixtures + RecorderPlugin
   test_performance.py  性能基准（阈值 = 目标值 x5 安全系数）
   test_edge_cases.py   边界 + 压力
@@ -62,7 +62,7 @@ pyproject.toml         pytest/coverage 配置
    物理行防文件膨胀，**代码行才是“内核保持小巧”的守门指标**——本内核
    docstring 占比约五成，只看物理行会在文档变详细后失真。
    加功能前先想能不能放到 `anima/plugins/` 或 `anima/utils/`（默认答案
-   **v1.3.0 余量：物理行 4 行、代码行 33 行**——下次往内核加东西之前，先解决
+   **v1.3.1 余量：物理行 3 行、代码行 28 行**——下次往内核加东西之前，先解决
    规模问题（精简文档 / 非功能点外移到 `anima/plugins/` / 正式上调上限）。
    通常是“能”）；新增公共能力前先估代码行数。
 
@@ -190,6 +190,10 @@ pyproject.toml         pytest/coverage 配置
   `plugin.ctx = ctx`。`Plugin.ctx` 只在 `if TYPE_CHECKING` 块内声明——运行时
   没有这个类属性，因此**不要在契约层运行时 import Context**（会倒置架构 §2 的
 - `config_defaults` 是**只读映射**：声明式类属性不该被子类就地写脏（同
+- **`ctx` 是内核保留属性名**（v1.3.1 写进契约）：框架在 `load()` 前写
+  `plugin.ctx`。子类若声明只读 `ctx`（property），注入会失败——`_inject_ctx`
+  会把它转成带说明的 `LifecycleError`。锁死用例：
+  `test_plugin_with_readonly_ctx_gives_actionable_error`。
   `dependencies` 的理由）。不要把它改成普通 dict。
   依赖方向）。锁死用例：`test_plugin_ctx_injected_for_all_phases`、
   `test_plugin_ctx_refreshed_after_restart`。

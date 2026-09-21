@@ -1,11 +1,7 @@
 """生命周期管理器：加载/启用/禁用/卸载全流程管理，含 Kahn 拓扑排序。
 
-状态机::
-
-    unloaded -> loaded -> enabled -> disabled -> unloaded
-
-其中 ``enabled`` 状态下调用 ``unload`` 会先自动 ``disable`` 再卸载；
-其余任何跳跃式转换都是 :class:`LifecycleError`。
+状态机：``unloaded -> loaded -> enabled -> disabled -> unloaded``；
+``enabled`` 下 ``unload`` 先自动 ``disable``，其余跳跃式转换抛 :class:`LifecycleError`。
 """
 
 from __future__ import annotations
@@ -95,7 +91,7 @@ class LifecycleManager:
         try:
             for plugin in ordered:
                 ctx = Context(self._app, plugin)
-                plugin.ctx = ctx  # v1.2：生命周期全阶段可用的注入
+                _inject_ctx(plugin, ctx)  # v1.2：生命周期全阶段可用的注入
                 self._plugins[plugin.name] = plugin
                 self._states[plugin.name] = _LOADED
                 self._load_order.append(plugin.name)
@@ -176,7 +172,7 @@ class LifecycleManager:
             )
 
         ctx = Context(self._app, plugin)
-        plugin.ctx = ctx
+        _inject_ctx(plugin, ctx)
         self._plugins[plugin.name] = plugin
         self._states[plugin.name] = _LOADED
         self._load_order.append(plugin.name)
@@ -309,6 +305,14 @@ def _find_cycle(dependents: dict[str, list[str]]) -> list[str]:
             if found is not None:
                 return found
     return []  # pragma: no cover - 调用方已保证存在环路
+
+
+def _inject_ctx(plugin: Plugin, ctx: Context) -> None:
+    """注入 ``plugin.ctx``；插件自己声明了只读 ``ctx`` 时给出可操作报错（v1.3.1）。"""
+    try:
+        plugin.ctx = ctx
+    except AttributeError as exc:
+        raise LifecycleError(f"插件 {plugin.name!r} 的 ctx 不可写：ctx 是内核保留属性名") from exc
 
 
 async def _call(method: Any, *args: Any) -> None:
