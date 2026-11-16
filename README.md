@@ -6,9 +6,9 @@
 怎么通信**——插件生命周期管理、事件总线、服务注册表、副作用自动回滚，  
 全部基于标准库实现。
 
-> **关于本项目**：这是 [AnimaPet 桌面宠物](https://github.com/) 使用的插件内核，
+> **关于本项目**：这是 [AnimaPet 桌面宠物](https://github.com/YunQing-hub2006/AnimaPet) 使用的插件内核，
 > 也是一套可独立使用的通用插件框架。项目采用 **MIT 许可**开源，详见 [LICENSE](LICENSE)。
-> 配套应用与角色卡素材见同作者的 AnimaPet 仓库。
+> 配套应用与角色卡素材见 [AnimaPet 仓库](https://github.com/YunQing-hub2006/AnimaPet)。
 
 |            |                                                      |
 | ---------- | ---------------------------------------------------- |
@@ -176,17 +176,6 @@ docs/
 .venv/Scripts/python check_kernel_rules.py    # raw<1200 + code<650 + 无第三方 import
 .venv/Scripts/python examples/hello.py        # 跑一个最小示例
 ```
-
----
-
-## 内核铁律
-
-1. `core/` 的 import 只允许标准库（`check_kernel_rules.py` 自动校验）
-2. 内核不知道角色、聊天、天气、LLM 是什么
-3. 内核只回答：插件怎么活、怎么死、怎么通信
-4. 所有公共接口类型注解完整
-5. 每个模块行覆盖率 >= 90%
-6. `core/` 规模双口径：`raw < 1200` 物理行且 `code < 650` 代码行
 
 ---
 
