@@ -10,7 +10,7 @@
 
 ```bash
 # Windows（仓库自带 .venv，Python 3.13）
-cd E:\Zcode-work\work
+cd <项目根目录>
 .venv\Scripts\python -m pytest tests/test_core/ -v        # 全量测试
 .venv\Scripts\python -m pytest tests/test_core/ --cov=anima.core --cov-report=term
 .venv\Scripts\python check_kernel_rules.py                 # 铁律自动检查
