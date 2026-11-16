@@ -1,8 +1,29 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
 .venv/
+*.egg-info/
 dist/
 build/
+
+# 开发工具的会话状态/计划（私有数据，勿入库）
+.mimosa/
+.zcode/
+.workbuddy/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 本地密钥与环境变量
+.env
+.env.*
+*.local
